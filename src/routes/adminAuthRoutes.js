@@ -1,0 +1,10 @@
+import { Router } from 'express';
+import rateLimit from 'express-rate-limit';
+import { adminAuth } from '../middleware/adminAuth.js';
+import { login, logout, me, changeInitialPassword } from '../controllers/adminAuthController.js';
+const r=Router();
+r.post('/login',rateLimit({windowMs:15*60*1000,limit:20,standardHeaders:true,legacyHeaders:false}),login);
+r.post('/logout',adminAuth,logout);
+r.get('/me',adminAuth,me);
+r.post('/change-initial-password',adminAuth,changeInitialPassword);
+export default r;

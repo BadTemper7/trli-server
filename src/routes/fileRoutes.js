@@ -1,0 +1,1 @@
+import {Router} from 'express';import {auth} from '../middleware/auth.js';import {verificationFile,preAdviceFile} from '../controllers/fileController.js';const r=Router();r.use(auth);r.get('/verification/:id',verificationFile);r.get('/pre-advice/:bookingId/:id',preAdviceFile);export default r;

@@ -1,0 +1,1 @@
+export const ok=(res,data={},message='Operation completed.')=>res.json({success:true,message,data});export class AppError extends Error{constructor(message,status=400,errors=[]){super(message);this.status=status;this.errors=errors}}export const asyncHandler=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next);

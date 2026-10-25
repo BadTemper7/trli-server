@@ -1,0 +1,1 @@
+import mongoose from 'mongoose';const schema=new mongoose.Schema({email:{type:String,index:true},otpHash:String,purpose:{type:String,default:'REGISTER'},attempts:{type:Number,default:0},verified:{type:Boolean,default:false},lastSentAt:Date,expiresAt:{type:Date,index:{expireAfterSeconds:0}}},{timestamps:true});export default mongoose.model('EmailOtp',schema);

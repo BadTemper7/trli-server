@@ -1,0 +1,16 @@
+import { Router } from 'express';
+import { adminAuth, requirePasswordChanged } from '../middleware/adminAuth.js';
+import { requirePermission } from '../middleware/requirePermission.js';
+import { MODULES, ACTIONS } from '../constants/permissions.js';
+import { validateId } from '../middleware/validateId.js';
+import { createUser,getUser,listUsers,permissionCatalog,reissueTemporaryPassword,updatePermissions,updateStatus,updateUser } from '../controllers/adminUserController.js';
+const r=Router();r.use(adminAuth,requirePasswordChanged);
+r.get('/permission-catalog',requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.VIEW),permissionCatalog);
+r.get('/',requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.VIEW),listUsers);
+r.post('/',requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.CREATE),createUser);
+r.get('/:id',validateId(),requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.VIEW),getUser);
+r.put('/:id',validateId(),requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.EDIT),updateUser);
+r.patch('/:id/status',validateId(),requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.EDIT),updateStatus);
+r.put('/:id/permissions',validateId(),requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.MANAGE_ACCESS),updatePermissions);
+r.post('/:id/reissue-temporary-password',validateId(),requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.RESET_PASSWORD),reissueTemporaryPassword);
+export default r;

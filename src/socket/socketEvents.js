@@ -1,0 +1,2 @@
+import { MODULE_ACTIONS } from '../constants/permissions.js';
+export function registerSocketEvents(socket){if(socket.data.admin){socket.join(`admin-user:${socket.data.userId}`);if(socket.data.role==='SUPER_ADMIN'){Object.keys(MODULE_ACTIONS).forEach(m=>socket.join(`admin-module:${m}`))}else{for(const p of socket.data.permissions||[])if(p.actions?.includes('VIEW'))socket.join(`admin-module:${p.module}`)}}else{socket.join(`client:${socket.data.userId}`);if(socket.data.companyId)socket.join(`company:${socket.data.companyId}`)}socket.on('disconnect',()=>{})}
