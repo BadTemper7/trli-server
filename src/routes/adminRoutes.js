@@ -4,9 +4,14 @@ import { requirePermission } from '../middleware/requirePermission.js';
 import { MODULES, ACTIONS } from '../constants/permissions.js';
 import { validateId } from '../middleware/validateId.js';
 import { list, detail, document, approve, reject } from '../controllers/adminController.js';
+import { dashboard, reports } from '../controllers/analyticsController.js';
 
 const router = Router();
 router.use(adminAuth, requirePasswordChanged);
+
+
+router.get('/dashboard', requirePermission(MODULES.DASHBOARD, ACTIONS.VIEW), dashboard);
+router.get('/reports', requirePermission(MODULES.REPORTS, ACTIONS.VIEW), reports);
 
 router.get('/client-verifications', requirePermission(MODULES.CLIENT_VERIFICATION, ACTIONS.VIEW), list);
 router.get('/client-verifications/:id', validateId(), requirePermission(MODULES.CLIENT_VERIFICATION, ACTIONS.VIEW), detail);

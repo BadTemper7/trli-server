@@ -147,8 +147,8 @@ export const create = asyncHandler(async (req, res) => {
 export const update = asyncHandler(async (req, res) => {
   const item = await PreAdvice.findOne({ _id: req.params.id, company: req.user.company._id });
   if (!item) throw new AppError('Pre-advice not found.', 404);
-  if (['COMPLETED', 'CANCELLED'].includes(item.status)) {
-    throw new AppError('This booking can no longer be edited.', 400);
+  if (item.workflowStage !== 'BOOKING_SUBMITTED' || !['DRAFT', 'SUBMITTED'].includes(item.status)) {
+    throw new AppError('Only bookings that are still awaiting Pre-advice approval can be edited by the client.', 409);
   }
 
   const updates = pick(req.body);
@@ -199,8 +199,8 @@ export const cancel = asyncHandler(async (req, res) => {
   const item = await PreAdvice.findOne({ _id: req.params.id, company: req.user.company._id });
   if (!item) throw new AppError('Pre-advice not found.', 404);
   if (item.status === 'CANCELLED') throw new AppError('This booking is already cancelled.', 409);
-  if (['GATED_IN', 'COMPLETED'].includes(item.status) || ['GATE_IN_PAYMENT_SUBMITTED', 'GATE_IN', 'INVENTORY', 'STORAGE', 'GATE_OUT_REQUESTED', 'GATE_OUT_PAYMENT_PENDING', 'GATE_OUT_PAYMENT_SUBMITTED', 'GATE_OUT_APPROVED', 'READY_FOR_RELEASE', 'CONTAINER_RELEASED'].includes(item.workflowStage)) {
-    throw new AppError('This booking can no longer be cancelled because container processing has already started.', 409);
+  if (item.workflowStage !== 'BOOKING_SUBMITTED' || !['DRAFT', 'SUBMITTED'].includes(item.status)) {
+    throw new AppError('This booking can no longer be cancelled because it has already been approved in Pre-advice.', 409);
   }
 
   const reason = String(req.body?.reason || '').trim().slice(0, 500);
