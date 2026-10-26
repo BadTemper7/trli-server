@@ -1,9 +1,12 @@
 import PreAdvice from '../models/PreAdvice.js';
+import mongoose from 'mongoose';
 import { getIO, emitToAdminModule } from '../socket/index.js';
 import { MODULES } from '../constants/permissions.js';
 import { createNotification } from '../services/notificationService.js';
 import { asyncHandler, ok, AppError } from '../utils/http.js';
 import { validateHourlySchedule } from '../utils/scheduleValidation.js';
+import {nextReference} from '../utils/referenceNumbers.js';
+import {reserveSlot,releaseSlot,validateSlot,slotAvailability} from '../utils/bookingSlots.js';
 import { ensureWorkflow, syncWorkflowFromStatus } from '../utils/preAdviceWorkflow.js';
 
 const allowed = [
@@ -24,7 +27,6 @@ const allowed = [
   'weight',
   'cargoDescription',
   'remarks',
-  'status',
 ];
 
 const pick = (body) => Object.fromEntries(
@@ -48,24 +50,14 @@ function validateGateInSchedule(data, existing = null) {
   if (error) throw new AppError(error, 400);
 }
 
-const ref = async () => {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  const prefix = `PA-${y}${m}${day}-`;
-  const last = await PreAdvice.findOne({ bookingReference: { $regex: `^${prefix}` } })
-    .sort({ bookingReference: -1 });
-  const next = last ? Number(last.bookingReference.split('-').pop()) + 1 : 1;
-  return `${prefix}${String(next).padStart(4, '0')}`;
-};
+export const availability = asyncHandler(async(req,res)=>{if(!/^\d{4}-\d{2}-\d{2}$/.test(String(req.query.day||'')))throw new AppError('A valid date is required.',400); ok(res,{slots:await slotAvailability(req.query.day)});});
 
 export const list = asyncHandler(async (req, res) => {
   const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
   const limit = Math.min(50, Math.max(5, Number.parseInt(req.query.limit, 10) || 10));
   const filter = { company: req.user.company._id };
   const status = String(req.query.status || '').trim().toUpperCase();
-  if (['DRAFT', 'SUBMITTED', 'SCHEDULED', 'READY_FOR_GATE_IN', 'GATED_IN', 'COMPLETED', 'CANCELLED'].includes(status)) filter.status = status;
+  if (['DRAFT', 'SUBMITTED', 'REJECTED', 'SCHEDULED', 'READY_FOR_GATE_IN', 'GATED_IN', 'COMPLETED', 'CANCELLED'].includes(status)) filter.status = status;
   const search = String(req.query.search || '').trim();
   if (search) {
     const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -75,7 +67,8 @@ export const list = asyncHandler(async (req, res) => {
 
   const [items, total, summaryRows] = await Promise.all([
     PreAdvice.find(filter)
-      .select('bookingReference containerNumber containerSize containerType scheduledGateDateIn scheduledGateTimeIn shippingLine status workflowStage cancellation createdAt updatedAt')
+      .select('bookingReference containerNumber containerSize containerType scheduledGateDateIn scheduledGateTimeIn shippingLine status workflowStage cancellation createdAt updatedAt gateIn.actualGateInAt storage gateOut truckPlateNumber driverName driverLicenceNumber hauler loadStatus')
+      .populate('storage.block','name')
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(limit)
@@ -93,6 +86,7 @@ export const list = asyncHandler(async (req, res) => {
   ]);
   const summary = summaryRows[0] || { all: 0, pending: 0, yard: 0, complete: 0 };
   ok(res, {
+    bookings: items.map(item=>({...item,id:String(item._id)})),
     items,
     summary: { all: summary.all || 0, pending: summary.pending || 0, yard: summary.yard || 0, complete: summary.complete || 0 },
     pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
@@ -112,16 +106,21 @@ export const create = asyncHandler(async (req, res) => {
   const data = pick(req.body);
   validateGateInSchedule(data);
 
-  data.bookingReference = await ref();
+  data.bookingReference = await nextReference('BOOKING');
   data.company = req.user.company._id;
   data.createdBy = req.user._id;
-  data.status = data.status || 'SUBMITTED';
+  data.status = 'SUBMITTED';
   data.statusHistory = [{ status: data.status }];
   data.workflowStage = 'BOOKING_SUBMITTED';
   data.workflowHistory = [{ stage: 'BOOKING_SUBMITTED', changedAt: new Date() }];
   data.documents = fileDocs(req);
 
-  const item = await PreAdvice.create(data);
+  const item = new PreAdvice(data);
+  const session=await mongoose.startSession();
+  try {await session.withTransaction(async()=>{
+    await reserveSlot(item._id,item.scheduledGateDateIn,item.scheduledGateTimeIn,session);
+    await item.save({session});
+  });}finally{await session.endSession();}
 
   emitToAdminModule(MODULES.PRE_ADVICE, 'pre-advice:new', {
     id: String(item._id),
@@ -156,43 +155,34 @@ export const update = asyncHandler(async (req, res) => {
     validateGateInSchedule(updates, item);
   }
 
-  const previous = item.status;
-  Object.assign(item, updates);
-
+  const oldDate = item.scheduledGateDateIn;
+  const oldTime = item.scheduledGateTimeIn;
+  const newDate = updates.scheduledGateDateIn ?? oldDate;
+  const newTime = updates.scheduledGateTimeIn ?? oldTime;
+  const changedSlot = newDate !== oldDate || newTime !== oldTime;
   const newDocs = fileDocs(req);
-  if (newDocs.length) item.documents.push(...newDocs);
-  if (item.status !== previous) {
-    const changedAt = new Date();
-    item.statusHistory.push({ status: item.status, changedAt });
-    syncWorkflowFromStatus(item, item.status, { changedAt });
-  }
-
-  await item.save();
-
-  getIO()?.to(`company:${item.company}`).emit('pre-advice:updated', item);
-  emitToAdminModule(MODULES.PRE_ADVICE, 'pre-advice:updated', item);
-
-  if (item.status !== previous) {
-    getIO()?.to(`company:${item.company}`).emit('pre-advice:status-updated', {
-      id: String(item._id),
-      bookingReference: item.bookingReference,
-      previousStatus: previous,
-      status: item.status,
-      updatedAt: item.updatedAt,
-      workflowStage: item.workflowStage,
-      workflowHistory: item.workflowHistory,
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const fresh = await PreAdvice.findOne({
+        _id: item._id, company: req.user.company._id, status: 'SUBMITTED', workflowStage: 'BOOKING_SUBMITTED',
+      }).session(session);
+      if (!fresh) throw new AppError('Booking is no longer editable.', 409);
+      if (changedSlot) await reserveSlot(fresh._id, newDate, newTime, session);
+      Object.assign(fresh, updates);
+      if (newDocs.length) fresh.documents.push(...newDocs);
+      await fresh.save({ session });
+      if (changedSlot) await releaseSlot(fresh._id, oldDate, oldTime, session);
     });
-    await createNotification({
-      company: item.company,
-      audience: 'CLIENT',
-      type: 'PRE_ADVICE_STATUS_CHANGED',
-      title: 'Booking Status Updated',
-      message: `${item.bookingReference}: ${previous} → ${item.status}`,
-      data: { id: item._id, status: item.status },
-    });
-  }
+  } finally { await session.endSession(); }
 
-  ok(res, { item }, 'Pre-advice updated.');
+
+  const updated = await PreAdvice.findById(item._id);
+  getIO()?.to(`company:${item.company}`).emit('pre-advice:updated', updated);
+  emitToAdminModule(MODULES.PRE_ADVICE, 'pre-advice:updated', updated);
+
+
+  ok(res, { item: updated }, 'Pre-advice updated.');
 });
 
 export const cancel = asyncHandler(async (req, res) => {
@@ -205,10 +195,20 @@ export const cancel = asyncHandler(async (req, res) => {
 
   const reason = String(req.body?.reason || '').trim().slice(0, 500);
   const now = new Date();
-  item.status = 'CANCELLED';
-  item.cancellation = { cancelledAt: now, cancelledBy: req.user._id, reason };
-  item.statusHistory.push({ status: 'CANCELLED', changedAt: now, note: reason || 'Cancelled by client' });
-  await item.save();
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const fresh = await PreAdvice.findOne({ _id: item._id, company: req.user.company._id, status: 'SUBMITTED', workflowStage: 'BOOKING_SUBMITTED' }).session(session);
+      if (!fresh) throw new AppError('The booking is no longer eligible for cancellation.', 409);
+      fresh.status = 'CANCELLED';
+      fresh.cancellation = { cancelledAt: now, cancelledBy: req.user._id, reason };
+      fresh.statusHistory.push({ status: 'CANCELLED', changedAt: now, note: reason || 'Cancelled by client' });
+      await fresh.save({ session });
+      await releaseSlot(fresh._id, fresh.scheduledGateDateIn, fresh.scheduledGateTimeIn, session);
+    });
+  } finally { await session.endSession(); }
+  item.status='CANCELLED';
+  item.cancellation={cancelledAt:now,cancelledBy:req.user._id,reason};
 
   const payload = {
     id: String(item._id),

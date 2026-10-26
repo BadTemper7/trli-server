@@ -15,6 +15,7 @@ const schema = new mongoose.Schema({
   position: { type: String, default: '', trim: true },
   passwordHash: { type: String, required: true, select: false },
   role: { type: String, enum: ['SUPER_ADMIN','ADMIN_USER'], default: 'ADMIN_USER', index: true },
+  isSystemProtected: { type:Boolean, default:false, immutable:true },
   status: { type: String, enum: ['ACTIVE','INACTIVE'], default: 'ACTIVE', index: true },
   permissions: { type: [permissionSchema], default: [] },
   mustChangePassword: { type: Boolean, default: true },
@@ -25,6 +26,8 @@ const schema = new mongoose.Schema({
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
   updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
 }, { timestamps: true });
+
+schema.index({isSystemProtected:1},{unique:true,partialFilterExpression:{isSystemProtected:true},name:'one_protected_system_admin'});
 
 schema.methods.toSafeObject = function toSafeObject() {
   const obj = this.toObject();

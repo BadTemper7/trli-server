@@ -11,6 +11,10 @@ import { emitToAdminModule, getIO } from '../socket/index.js';
 import { AppError, asyncHandler } from '../utils/http.js';
 import { advanceWorkflow, ensureWorkflow } from '../utils/preAdviceWorkflow.js';
 import { validateHourlySchedule } from '../utils/scheduleValidation.js';
+import {buildInvoice,requirePaid} from '../services/invoicingService.js';
+import {reserveSlot,releaseSlot} from '../utils/bookingSlots.js';
+import {enqueueBookingMail} from '../services/transactionalMail.js';
+import mongoose from 'mongoose';
 
 const adminId = (req) => String(req.admin?._id || req.admin?.id || 'admin');
 
@@ -81,6 +85,14 @@ async function matchingRates(item, collectionPoint) {
 }
 
 async function paymentSummary(item, collectionPoint) {
+  const Invoice = (await import('../models/Invoice.js')).default;
+  const invoice = await Invoice.findOne({booking:item._id,type:collectionPoint}).lean();
+  if (invoice) return {
+    invoiceId:String(invoice._id), invoiceNumber:invoice.number,
+    paymentStatus:invoice.status,charges:invoice.lines||[],total:invoice.total,
+    subtotal:invoice.subtotal,vat:invoice.vat,
+  };
+  // Historical records without an invoice can still show their legacy rate data.
   const charges = await matchingRates(item, collectionPoint);
   return { charges, total: charges.reduce((sum, row) => sum + Number(row.amount || 0), 0) };
 }
@@ -91,7 +103,8 @@ async function validatePaymentMethod(method, referenceNumber, total) {
   if (!code) throw new AppError('Select a payment type.', 400);
   const type = await PaymentType.findOne({ code, status: 'ACTIVE' }).lean();
   if (!type) throw new AppError('Selected payment type is unavailable or inactive.', 400);
-  if (type.code !== 'CASH' && (!type.bankName || !type.accountName || !type.accountNumber)) {
+  if (type.code === 'CASH') throw new AppError('Only online payments are supported.',400);
+  if (!type.bankName || !type.accountName || !type.accountNumber) {
     throw new AppError(`${type.name} account details are not configured yet. Update Payment Types first.`, 400);
   }
   if (total > 0 && type.requiresReference && !referenceNumber) {
@@ -139,6 +152,7 @@ function itemDto(item, extras = {}) {
     remarks: item.remarks || '',
     status: item.status,
     statusHistory: item.statusHistory || [],
+    preAdviceReview: item.preAdviceReview || {},
     workflowStage: item.workflowStage,
     workflowHistory: item.workflowHistory || [],
     gateIn: item.gateIn || {},
@@ -202,7 +216,7 @@ function buildFilter(query = {}, stages = null) {
   return filter;
 }
 
-const LIST_FIELDS = 'bookingReference company containerNumber containerSize containerType loadStatus transactionClassification shippingLine scheduledGateDateIn scheduledGateTimeIn truckPlateNumber driverName driverLicenceNumber hauler weight status workflowStage gateIn inventory storage gateOut createdAt updatedAt';
+const LIST_FIELDS = 'bookingReference company containerNumber containerSize containerType loadStatus transactionClassification shippingLine scheduledGateDateIn scheduledGateTimeIn truckPlateNumber driverName driverLicenceNumber hauler weight status workflowStage preAdviceReview gateIn inventory storage gateOut createdAt updatedAt';
 
 async function listItems(filter, query = {}) {
   const page = Math.max(1, Number.parseInt(query.page, 10) || 1);
@@ -221,7 +235,12 @@ async function listItems(filter, query = {}) {
 }
 
 export const listAdminPreAdvice = asyncHandler(async (req, res) => {
-  const { rows, pagination } = await listItems(buildFilter(req.query), req.query);
+  const filter=buildFilter(req.query);
+  filter.$and=[{status:{$in:['SUBMITTED','READY_FOR_GATE_IN','REJECTED']}},{$or:[{workflowStage:'BOOKING_SUBMITTED'},{workflowStage:'READY_FOR_GATE_IN'}]}];
+  if(req.query.approval==='PENDING')filter.$and.push({status:'SUBMITTED',workflowStage:'BOOKING_SUBMITTED'});
+  if(req.query.approval==='APPROVED')filter.$and.push({status:'READY_FOR_GATE_IN'});
+  if(req.query.approval==='REJECTED')filter.$and.push({status:'REJECTED'});
+  const { rows, pagination } = await listItems(filter, req.query);
   res.json({ success: true, message: 'Pre-advice records loaded.', data: { items: rows.map((row) => itemDto(row)), pagination } });
 });
 
@@ -232,27 +251,70 @@ export const getAdminPreAdvice = asyncHandler(async (req, res) => {
 });
 
 export const approvePreAdvice = asyncHandler(async (req, res) => {
-  const item = await findItem(req.params.id);
-  if (item.status !== 'SUBMITTED' && item.workflowStage !== 'BOOKING_SUBMITTED') throw new AppError('Only submitted bookings can be approved.', 409);
-  const now = new Date();
-  item.status = 'READY_FOR_GATE_IN';
-  item.statusHistory.push({ status: 'READY_FOR_GATE_IN', changedAt: now, note: String(req.body?.note || '') });
-  advanceWorkflow(item, ['BOOKING_APPROVED', 'READY_FOR_GATE_IN'], { changedAt: now, note: String(req.body?.note || '') });
-  const payment = await paymentSummary(item, 'GATE_IN');
-  item.gateIn.payment.amountDue = payment.total;
-  await item.save();
-  await auditAdminAction({ performedBy: req.admin._id, action: 'PRE_ADVICE_APPROVED', changes: { bookingReference: item.bookingReference, containerNumber: item.containerNumber } });
-  const data = await notifyWorkflow(item, MODULES.PRE_ADVICE, 'operations:pre-advice-updated', 'Booking Approved', `${item.bookingReference} is approved and ready for gate-in processing.`);
-  emitToAdminModule(MODULES.GATE_IN, 'gate-in:queue-updated', data);
-  res.json({ success: true, message: 'Booking approved and moved to Gate-in queue.', data });
+  const session=await mongoose.startSession();
+  let booking,invoice;
+  try{
+    await session.withTransaction(async()=>{
+      booking=await PreAdvice.findOne({_id:req.params.id,status:'SUBMITTED',workflowStage:'BOOKING_SUBMITTED'}).session(session);
+      if(!booking)throw new AppError('Only pending pre-advice can be approved.',409);
+      const now=new Date();
+      booking.status='READY_FOR_GATE_IN';booking.statusHistory.push({status:'READY_FOR_GATE_IN',changedAt:now,note:String(req.body?.note||'')});
+      booking.preAdviceReview={decision:'APPROVED',reason:'',reviewedAt:now,reviewedBy:req.admin._id};
+      advanceWorkflow(booking,['BOOKING_APPROVED','READY_FOR_GATE_IN'],{changedAt:now});
+      // Only create a new invoice if none exists. An existing invoice is immutable.
+      const {calculateInvoice}=await import('../services/invoicingService.js');
+      const {nextReference}=await import('../utils/referenceNumbers.js');
+      const Invoice=(await import('../models/Invoice.js')).default;
+      invoice=await Invoice.findOne({booking:booking._id,type:'GATE_IN'}).session(session);
+      if(!invoice){
+        const quote=await calculateInvoice(booking,'GATE_IN');
+        invoice=(await Invoice.create([{...quote,number:await nextReference('INVOICE',new Date(),session),booking:booking._id,company:booking.company,type:'GATE_IN',status:quote.total===0?'PAID':'UNPAID'}],{session}))[0];
+      }
+      booking.gateIn.payment.amountDue=invoice.total;
+      await booking.save({session});
+      await enqueueBookingMail(booking,{event:'PRE_ADVICE_APPROVED',title:'Booking approved',message:'Your booking has been approved. Your gate-in invoice is ready for online payment.',invoiceNumber:invoice.number,amount:invoice.total},session);
+    });
+  }finally{await session.endSession();}
+  await auditAdminAction({performedBy:req.admin._id,action:'PRE_ADVICE_APPROVED',changes:{bookingReference:booking.bookingReference}});
+  const item=await findItem(booking._id);
+  const data=await notifyWorkflow(item,MODULES.PRE_ADVICE,'operations:pre-advice-updated','Booking Approved',`${item.bookingReference} is ready for gate-in payment.`);
+  emitToAdminModule(MODULES.GATE_IN,'gate-in:queue-updated',data);
+  res.json({success:true,message:'Pre-advice approved; gate-in invoice generated.',data});
+});
+
+export const rejectPreAdvice = asyncHandler(async (req, res) => {
+  const reason = String(req.body?.reason || '').trim().slice(0, 800);
+  if (!reason) throw new AppError('A rejection reason is required.', 400);
+  const session=await mongoose.startSession();
+  let id;
+  try {
+    await session.withTransaction(async()=>{
+      const item=await PreAdvice.findOne({_id:req.params.id,status:'SUBMITTED',workflowStage:'BOOKING_SUBMITTED'}).session(session);
+      if(!item)throw new AppError('Only pending pre-advice can be rejected.',409);
+      const now=new Date();
+      item.status='REJECTED';
+      item.preAdviceReview={decision:'REJECTED',reason,reviewedAt:now,reviewedBy:req.admin._id};
+      item.statusHistory.push({status:'REJECTED',changedAt:now,note:reason});
+      item.workflowHistory.push({stage:'BOOKING_SUBMITTED',changedAt:now,note:`Rejected: ${reason}`});
+      await item.save({session});
+      await releaseSlot(item._id,item.scheduledGateDateIn,item.scheduledGateTimeIn,session);
+      await enqueueBookingMail(item,{event:'PRE_ADVICE_REJECTED',title:'Booking rejected',message:`Your pre-advice was rejected: ${reason}`},session);
+      id=item._id;
+    });
+  }finally{await session.endSession();}
+  const item=await findItem(id);
+  await auditAdminAction({performedBy:req.admin._id,action:'PRE_ADVICE_REJECTED',changes:{bookingReference:item.bookingReference,reason}});
+  const data=await notifyWorkflow(item,MODULES.PRE_ADVICE,'operations:pre-advice-updated','Booking Rejected',`${item.bookingReference}: ${reason}`);
+  res.json({success:true,message:'Pre-advice rejected.',data});
 });
 
 export const listGateIn = asyncHandler(async (req, res) => {
   const stages = ['READY_FOR_GATE_IN', 'GATE_IN_PAYMENT_SUBMITTED'];
   const { rows, pagination } = await listItems(buildFilter(req.query, stages), req.query);
-  const items = await Promise.all(rows.map(async (row) => {
-    const payment = await paymentSummary(row, 'GATE_IN');
-    return itemDto(row, { gateInCharges: payment });
+  const Invoice=(await import('../models/Invoice.js')).default;
+  const items=await Promise.all(rows.map(async row=>{
+    const invoice=await Invoice.findOne({booking:row._id,type:'GATE_IN'}).lean();
+    return itemDto(row,{gateInCharges:{invoiceId:invoice?._id?String(invoice._id):null,total:invoice?.total??0,charges:invoice?.lines||[],invoiceNumber:invoice?.number,paymentStatus:invoice?.status}});
   }));
   res.json({ success: true, message: 'Gate-in queue loaded.', data: { items, pagination } });
 });
@@ -260,8 +322,8 @@ export const listGateIn = asyncHandler(async (req, res) => {
 
 export const inspectGateIn = asyncHandler(async (req, res) => {
   const item = await findItem(req.params.id);
-  if (item.workflowStage !== 'READY_FOR_GATE_IN') throw new AppError('Inspection can only be completed before Gate-in payment.', 409);
-  if (item.gateIn?.payment?.submittedAt) throw new AppError('Inspection cannot be changed after payment has been submitted.', 409);
+  if (!['READY_FOR_GATE_IN','GATE_IN_PAYMENT_SUBMITTED'].includes(item.workflowStage)) throw new AppError('Inspection is only available before physical gate-in.', 409);
+  if (item.gateIn?.payment?.submittedAt && req.body?.corrections && Object.keys(req.body.corrections).length) throw new AppError('Container and rate-driving details cannot be changed after online payment submission. Contact billing support for a formal adjustment.', 409);
 
   const status = String(req.body?.status || '').trim().toUpperCase();
   if (!['ACCEPTED', 'REJECTED'].includes(status)) throw new AppError('Inspection status must be ACCEPTED or REJECTED.', 400);
@@ -291,8 +353,8 @@ export const inspectGateIn = asyncHandler(async (req, res) => {
   };
 
   // Rate-driving corrections can change the Gate-in amount due.
-  const payment = await paymentSummary(item, 'GATE_IN');
-  item.gateIn.payment.amountDue = payment.total;
+  const invoice=await buildInvoice(item,'GATE_IN');
+  item.gateIn.payment.amountDue = invoice.total;
   await item.save();
   await auditAdminAction({
     performedBy: req.admin._id,
@@ -319,7 +381,7 @@ export const inspectGateIn = asyncHandler(async (req, res) => {
   res.json({
     success: true,
     message: status === 'ACCEPTED' ? 'Inspection accepted. Payment can now be collected.' : 'Inspection rejected. Payment is blocked until the container is accepted.',
-    data: itemDto(item, { gateInCharges: payment }),
+    data: itemDto(item, { gateInCharges: await paymentSummary(item,'GATE_IN') }),
   });
 });
 
@@ -352,6 +414,7 @@ async function applyGateInPayment(item, req, paymentSummaryResult) {
 }
 
 export const submitGateInPayment = asyncHandler(async (req, res) => {
+  throw new AppError('Admin payment recording is disabled. The client must submit online payment proof for independent verification.',403);
   const item = await findItem(req.params.id);
   if (!['READY_FOR_GATE_IN', 'GATE_IN_PAYMENT_SUBMITTED'].includes(item.workflowStage)) throw new AppError('Container is not ready for Gate-in payment.', 409);
   if (item.gateIn?.inspection?.status !== 'ACCEPTED') {
@@ -367,6 +430,7 @@ export const submitGateInPayment = asyncHandler(async (req, res) => {
 });
 
 export const cancelGateInPayment = asyncHandler(async (req, res) => {
+  throw new AppError('Payment cancellation is disabled. Use the verified invoice workflow.',403);
   const item = await findItem(req.params.id);
   if (!['READY_FOR_GATE_IN', 'GATE_IN_PAYMENT_SUBMITTED'].includes(item.workflowStage)) throw new AppError('Payment can only be cancelled before Gate-in is completed.', 409);
   if (!item.gateIn?.payment?.submittedAt) throw new AppError('There is no submitted Gate-in payment to cancel.', 409);
@@ -396,46 +460,35 @@ export const cancelGateInPayment = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'Gate-in payment cancelled. Payment details can be entered again.', data: itemDto(item, { gateInCharges: payment }) });
 });
 
-export const processGateIn = asyncHandler(async (req, res) => {
-  const item = await findItem(req.params.id);
-  if (!['READY_FOR_GATE_IN', 'GATE_IN_PAYMENT_SUBMITTED'].includes(item.workflowStage)) throw new AppError('Container is not ready for Gate-in.', 409);
-  if (item.gateIn?.inspection?.status !== 'ACCEPTED') throw new AppError('Gate-in inspection must be accepted before processing Gate-in.', 409);
-  const payment = await paymentSummary(item, 'GATE_IN');
-
-  // Gate-in submission owns payment submission. If payment was already recorded,
-  // the existing payment is reused; otherwise payment details are validated and
-  // recorded atomically before the container is gated in.
-  let recordedPayment = null;
-  if (payment.total > 0 && !item.gateIn?.payment?.submittedAt) {
-    recordedPayment = await applyGateInPayment(item, req, payment);
-  }
-
-  const now = new Date();
-  item.status = 'GATED_IN';
-  item.statusHistory.push({ status: 'GATED_IN', changedAt: now, note: String(req.body?.remarks || '') });
-  item.gateIn.actualGateInAt = now;
-  item.gateIn.processedBy = adminId(req);
-  item.gateIn.remarks = String(req.body?.remarks || '').trim().slice(0, 500);
-  item.inventory.status = 'IN_YARD';
-  item.inventory.receivedAt = now;
-  item.inventory.receivedBy = adminId(req);
-  item.inventory.condition = Array.isArray(item.gateIn.inspection.containerCondition)
-    ? item.gateIn.inspection.containerCondition
-    : item.gateIn.inspection.containerCondition ? [item.gateIn.inspection.containerCondition] : [];
-  item.inventory.sealNumber = item.gateIn.inspection.sealNumber || '';
-  item.inventory.notes = item.gateIn.inspection.remarks || item.inventory.notes || '';
-  if (!item.storage?.status) item.storage.status = 'WAITING_STORAGE';
-  advanceWorkflow(item, ['GATE_IN', 'INVENTORY'], { changedAt: now, note: item.gateIn.remarks });
-  await item.save();
-
-  if (recordedPayment) {
-    await auditAdminAction({ performedBy: req.admin._id, action: 'GATE_IN_PAYMENT_SUBMITTED', changes: { bookingReference: item.bookingReference, amount: recordedPayment.amountSubmitted, referenceNumber: recordedPayment.referenceNumber, method: recordedPayment.paymentType.code, source: 'GATE_IN_SUBMISSION' } });
-  }
-  await auditAdminAction({ performedBy: req.admin._id, action: 'CONTAINER_GATED_IN', changes: { bookingReference: item.bookingReference, containerNumber: item.containerNumber } });
-  const data = await notifyWorkflow(item, MODULES.GATE_IN, 'gate-in:completed', 'Container Gated In', `${item.containerNumber} entered the terminal and is now in inventory.`);
-  emitToAdminModule(MODULES.INVENTORY, 'inventory:updated', data);
-  emitToAdminModule(MODULES.STORAGE_MONITORING, 'storage:waiting-updated', data);
-  res.json({ success: true, message: recordedPayment ? 'Payment submitted and Gate-in completed. Container added to inventory.' : 'Gate-in completed. Container added to inventory.', data });
+export const processGateIn = asyncHandler(async (req,res) => {
+  const session=await mongoose.startSession();
+  let id;
+  try{
+    await session.withTransaction(async()=>{
+      const item=await PreAdvice.findOne({_id:req.params.id,workflowStage:{$in:['READY_FOR_GATE_IN','GATE_IN_PAYMENT_SUBMITTED']}}).session(session);
+      if(!item)throw new AppError('Booking was already gated in or is not approved.',409);
+      if(item.gateIn?.inspection?.status!=='ACCEPTED')throw new AppError('Gate-in inspection must be accepted.',409);
+      const Invoice=(await import('../models/Invoice.js')).default;
+      const paid=await Invoice.findOne({booking:item._id,type:'GATE_IN',status:'PAID',balance:0}).session(session);
+      if(!paid)throw new AppError('Gate-in payment is not verified.',409);
+      if(item.gateIn.actualGateInAt)throw new AppError('Container was already gated in.',409);
+      const now=new Date();
+      item.status='GATED_IN';item.statusHistory.push({status:'GATED_IN',changedAt:now,note:String(req.body?.remarks||'')});
+      item.gateIn.actualGateInAt=now;item.gateIn.processedBy=adminId(req);item.gateIn.remarks=String(req.body?.remarks||'').slice(0,500);
+      item.inventory.status='IN_YARD';item.inventory.receivedAt=now;item.inventory.receivedBy=adminId(req);
+      item.inventory.condition=[...(item.gateIn.inspection.containerCondition||[])];
+      item.inventory.sealNumber=item.gateIn.inspection.sealNumber||'';
+      item.storage.status='WAITING_STORAGE';
+      advanceWorkflow(item,['GATE_IN','INVENTORY'],{changedAt:now,note:'Physical gate-in confirmed'});
+      await item.save({session});id=item._id;
+    });
+  }finally{await session.endSession();}
+  const item=await findItem(id);
+  await auditAdminAction({performedBy:req.admin._id,action:'CONTAINER_GATED_IN',changes:{bookingReference:item.bookingReference}});
+  const data=await notifyWorkflow(item,MODULES.GATE_IN,'gate-in:completed','Container Gated In',`${item.containerNumber} entered the terminal and is now in inventory.`);
+  emitToAdminModule(MODULES.INVENTORY,'inventory:updated',data);
+  emitToAdminModule(MODULES.STORAGE_MONITORING,'storage:waiting-updated',data);
+  res.json({success:true,message:'Gate-in confirmed; container added to inventory.',data});
 });
 
 export const listInventory = asyncHandler(async (req, res) => {
@@ -464,7 +517,7 @@ export const updateInventory = asyncHandler(async (req, res) => {
 });
 
 export const listGateOut = asyncHandler(async (req, res) => {
-  const stages = ['STORAGE', 'GATE_OUT_REQUESTED', 'GATE_OUT_PAYMENT_PENDING', 'GATE_OUT_PAYMENT_SUBMITTED', 'GATE_OUT_APPROVED', 'READY_FOR_RELEASE'];
+  const stages = ['GATE_OUT_PAYMENT_SUBMITTED'];
   const { rows, pagination } = await listItems(buildFilter(req.query, stages), req.query);
   const items = await Promise.all(rows.map(async (row) => {
     const payment = await paymentSummary(row, 'GATE_OUT');
@@ -474,13 +527,14 @@ export const listGateOut = asyncHandler(async (req, res) => {
 });
 
 export const requestGateOut = asyncHandler(async (req, res) => {
+  throw new AppError('Gate-out requests must be initiated by the client portal.',403);
   const item = await findItem(req.params.id);
   if (item.workflowStage !== 'STORAGE' || item.storage?.status !== 'STORED') throw new AppError('Container must be stored before Gate-out can be requested.', 409);
   const date = String(req.body?.scheduledDate || '');
   const time = String(req.body?.scheduledTime || '');
   const scheduleError = validateHourlySchedule(date, time, 'Scheduled Gate-out');
   if (scheduleError) throw new AppError(scheduleError, 400);
-  const payment = await paymentSummary(item, 'GATE_OUT');
+  await reserveSlot(item._id,date,time);
   const now = new Date();
   item.gateOut.requestedAt = now;
   item.gateOut.requestedBy = adminId(req);
@@ -489,7 +543,8 @@ export const requestGateOut = asyncHandler(async (req, res) => {
   item.gateOut.truckPlateNumber = String(req.body?.truckPlateNumber || item.truckPlateNumber || '').trim();
   item.gateOut.driverName = String(req.body?.driverName || item.driverName || '').trim();
   item.gateOut.remarks = String(req.body?.remarks || '').trim().slice(0, 500);
-  item.gateOut.payment.amountDue = payment.total;
+  const invoice=await buildInvoice(item,'GATE_OUT');
+  item.gateOut.payment.amountDue = invoice.total;
   advanceWorkflow(item, ['GATE_OUT_REQUESTED', 'GATE_OUT_PAYMENT_PENDING'], { changedAt: now, note: `${date} ${time}` });
   await item.save();
   await auditAdminAction({ performedBy: req.admin._id, action: 'GATE_OUT_REQUESTED', changes: { bookingReference: item.bookingReference, scheduledDate: date, scheduledTime: time } });
@@ -498,6 +553,7 @@ export const requestGateOut = asyncHandler(async (req, res) => {
 });
 
 export const submitGateOutPayment = asyncHandler(async (req, res) => {
+  throw new AppError('Admin payment recording is disabled. The client must submit online payment proof.',403);
   const item = await findItem(req.params.id);
   if (!['GATE_OUT_PAYMENT_PENDING', 'GATE_OUT_PAYMENT_SUBMITTED'].includes(item.workflowStage)) throw new AppError('Container is not waiting for Gate-out payment.', 409);
   const payment = await paymentSummary(item, 'GATE_OUT');
@@ -525,7 +581,7 @@ export const approveGateOut = asyncHandler(async (req, res) => {
   const item = await findItem(req.params.id);
   if (!['GATE_OUT_PAYMENT_PENDING', 'GATE_OUT_PAYMENT_SUBMITTED'].includes(item.workflowStage)) throw new AppError('Container is not ready for Gate-out approval.', 409);
   const payment = await paymentSummary(item, 'GATE_OUT');
-  if (payment.total > 0 && !item.gateOut?.payment?.submittedAt) throw new AppError('Gate-out payment must be submitted before approval.', 409);
+  await requirePaid(item,'GATE_OUT');
   const now = new Date();
   item.gateOut.approvedAt = now;
   item.gateOut.approvedBy = adminId(req);
@@ -544,36 +600,36 @@ export const listRelease = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'Release queue loaded.', data: { items: rows.map((row) => itemDto(row)), pagination } });
 });
 
-export const releaseContainer = asyncHandler(async (req, res) => {
-  const item = await findItem(req.params.id);
-  if (item.workflowStage !== 'READY_FOR_RELEASE') throw new AppError('Container is not approved for release.', 409);
-  const now = new Date();
-  const oldStorage = item.storage?.block ? {
-    block: item.storage.block?._id || item.storage.block,
-    bay: item.storage.bay,
-    row: item.storage.row,
-    tier: item.storage.tier,
-  } : null;
-  item.gateOut.releasedAt = now;
-  item.gateOut.releasedBy = adminId(req);
-  item.gateOut.remarks = String(req.body?.remarks || item.gateOut.remarks || '').trim().slice(0, 500);
-  item.inventory.status = 'RELEASED';
-  item.storage.status = 'RELEASED';
-  item.storage.block = null;
-  item.storage.bay = null;
-  item.storage.row = null;
-  item.storage.tier = null;
-  item.status = 'COMPLETED';
-  item.statusHistory.push({ status: 'COMPLETED', changedAt: now, note: 'Container released' });
-  advanceWorkflow(item, 'CONTAINER_RELEASED', { changedAt: now, note: 'Container released from terminal' });
-  await item.save();
-  if (oldStorage?.block) {
-    await StorageMovement.create({ container: item._id, action: 'REMOVED', from: oldStorage, performedBy: adminId(req), performedAt: now });
-    await emitStorageOccupancy(oldStorage.block);
-  }
-  await auditAdminAction({ performedBy: req.admin._id, action: 'CONTAINER_RELEASED', changes: { bookingReference: item.bookingReference, containerNumber: item.containerNumber } });
-  const data = await notifyWorkflow(item, MODULES.RELEASE_CONTAINER, 'release:completed', 'Container Released', `${item.containerNumber} has been released from the terminal.`);
-  emitToAdminModule(MODULES.INVENTORY, 'inventory:updated', data);
-  emitToAdminModule(MODULES.STORAGE_MONITORING, 'storage:container-removed', { id: String(item._id), containerNumber: item.containerNumber });
-  res.json({ success: true, message: 'Container released successfully.', data });
+export const releaseContainer = asyncHandler(async (req,res) => {
+  const session=await mongoose.startSession();
+  let id,oldStorage,now;
+  try{
+    await session.withTransaction(async()=>{
+      const item=await PreAdvice.findOne({_id:req.params.id,workflowStage:'READY_FOR_RELEASE'}).session(session);
+      if(!item)throw new AppError('Container is not awaiting physical release.',409);
+      const Invoice=(await import('../models/Invoice.js')).default;
+      if(!await Invoice.exists({booking:item._id,type:'GATE_OUT',status:'PAID',balance:0}).session(session))throw new AppError('Gate-out invoice is not verified.',409);
+      if(!item.gateIn?.actualGateInAt||!item.gateOut?.approvedAt||item.gateOut?.releasedAt)throw new AppError('Invalid gate-out release status.',409);
+      oldStorage=item.storage?.block?{block:item.storage.block,bay:item.storage.bay,row:item.storage.row,tier:item.storage.tier}:null;
+      now=new Date();
+      item.gateOut.approvalStatus='RELEASED';item.gateOut.releasedAt=now;item.gateOut.releasedBy=adminId(req);
+      item.gateOut.finalDaysInTerminal=Math.max(1,Math.ceil((now.getTime()-new Date(item.gateIn.actualGateInAt).getTime())/86400000));
+      item.gateOut.remarks=String(req.body?.remarks||item.gateOut.remarks||'').slice(0,500);
+      item.inventory.status='RELEASED';item.storage.status='RELEASED';
+      item.storage.block=null;item.storage.bay=null;item.storage.row=null;item.storage.tier=null;
+      item.status='COMPLETED';item.statusHistory.push({status:'COMPLETED',changedAt:now,note:'Container physically released'});
+      advanceWorkflow(item,'CONTAINER_RELEASED',{changedAt:now,note:'Physical release confirmed'});
+      await item.save({session});
+      if(oldStorage?.block)await StorageMovement.create([{container:item._id,action:'REMOVED',from:oldStorage,performedBy:adminId(req),performedAt:now}],{session});
+      await enqueueBookingMail(item,{event:'CONTAINER_RELEASED',title:'Container released',message:`Your container was physically released on ${now.toLocaleString('en-PH',{timeZone:'Asia/Manila'})}.`},session);
+      id=item._id;
+    });
+  }finally{await session.endSession();}
+  if(oldStorage?.block)await emitStorageOccupancy(oldStorage.block);
+  const item=await findItem(id);
+  await auditAdminAction({performedBy:req.admin._id,action:'CONTAINER_RELEASED',changes:{bookingReference:item.bookingReference,containerNumber:item.containerNumber}});
+  const data=await notifyWorkflow(item,MODULES.RELEASE_CONTAINER,'release:completed','Container Released',`${item.containerNumber} has been physically released.`);
+  emitToAdminModule(MODULES.INVENTORY,'inventory:updated',data);
+  emitToAdminModule(MODULES.STORAGE_MONITORING,'storage:container-removed',{id:String(item._id),containerNumber:item.containerNumber});
+  res.json({success:true,message:'Physical container release recorded.',data});
 });

@@ -3,11 +3,14 @@ import { MODULES } from '../constants/permissions.js';
 import { emitToAdminModule } from '../socket/index.js';
 import { auditAdminAction } from '../services/adminAuditService.js';
 import { AppError, asyncHandler } from '../utils/http.js';
+import { ONLINE_METHODS, isConfiguredReceivingAccount } from '../services/paymentMethods.js';
 
 const DEFAULTS = [
-  { code: 'CASH', name: 'Cash', requiresReference: false, description: 'Cash payment collected at the terminal.' },
+  
   { code: 'BANK', name: 'Bank', requiresReference: true, description: 'Bank deposit or bank transfer payment.' },
   { code: 'E_WALLET', name: 'E-wallet', requiresReference: true, description: 'Electronic wallet payment.' },
+  { code: 'GCASH', name: 'GCash', bankName: 'GCash', requiresReference: true, description: 'GCash transfer.' },
+  { code: 'MAYA', name: 'Maya', bankName: 'Maya', requiresReference: true, description: 'Maya wallet transfer.' },
 ];
 
 const clean = (value, max = 300) => String(value ?? '').trim().slice(0, max);
@@ -27,21 +30,23 @@ function dto(row) {
     id: String(row._id), code: row.code, name: row.name, status: row.status,
     requiresReference: Boolean(row.requiresReference), description: row.description || '',
     bankName: row.bankName || '', accountName: row.accountName || '', accountNumber: row.accountNumber || '',
+    isConfigured: isConfiguredReceivingAccount(row),
     createdAt: row.createdAt, updatedAt: row.updatedAt,
   };
 }
 
 function normalize(body = {}, current = null) {
   const code = String(body.code ?? current?.code ?? '').trim().toUpperCase();
+  if (code === 'CASH') throw new AppError('Cash collection is not supported. Use an online payment method.',400);
   if (!PAYMENT_TYPE_CODES.includes(code)) throw new AppError('Select a valid payment type.', 400);
   const defaultRow = DEFAULTS.find((x) => x.code === code);
   const name = clean(body.name ?? current?.name ?? defaultRow?.name, 80);
   if (!name) throw new AppError('Payment type name is required.', 400);
   const status = String(body.status ?? current?.status ?? 'ACTIVE').toUpperCase();
   if (!['ACTIVE', 'INACTIVE'].includes(status)) throw new AppError('Invalid payment type status.', 400);
-  const requiresReference = code === 'CASH' ? false : body.requiresReference === undefined ? Boolean(current?.requiresReference ?? true) : Boolean(body.requiresReference);
+  const requiresReference = true; // All supported online transfers require a reference number.
   const paymentAccount = code === 'CASH' ? { bankName: '', accountName: '', accountNumber: '' } : {
-    bankName: clean(body.bankName ?? current?.bankName, 120),
+    bankName: clean(body.bankName ?? current?.bankName ?? defaultRow?.bankName, 120),
     accountName: clean(body.accountName ?? current?.accountName, 120),
     accountNumber: clean(body.accountNumber ?? current?.accountNumber, 120),
   };
@@ -63,7 +68,9 @@ export const listPaymentTypes = asyncHandler(async (req, res) => {
 
 export const listActivePaymentTypes = asyncHandler(async (req, res) => {
   await ensureDefaultPaymentTypes();
-  const rows = await PaymentType.find({ status: 'ACTIVE' }).sort({ code: 1 }).lean();
+  // Return active methods including unconfigured ones so the client can explain why
+  // payments are unavailable; the UI disables them until account details are saved.
+  const rows = await PaymentType.find({ status:'ACTIVE', code:{$in:ONLINE_METHODS} }).sort({ code: 1 }).lean();
   res.json({ success: true, message: 'Active payment types loaded.', data: rows.map(dto) });
 });
 

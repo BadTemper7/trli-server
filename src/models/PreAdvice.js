@@ -41,7 +41,7 @@ const workflowHistorySchema = new mongoose.Schema({
 
 
 const paymentSchema = new mongoose.Schema({
-  status: { type: String, enum: ['PENDING', 'SUBMITTED', 'CANCELLED'], default: 'PENDING' },
+  status: { type: String, enum: ['PENDING', 'SUBMITTED', 'CANCELLED', 'VERIFIED', 'REJECTED'], default: 'PENDING' },
   amountDue: { type: Number, default: 0, min: 0 },
   amountSubmitted: { type: Number, default: 0, min: 0 },
   referenceNumber: { type: String, default: '' },
@@ -86,6 +86,7 @@ const inventorySchema = new mongoose.Schema({
 }, { _id: false });
 
 const gateOutSchema = new mongoose.Schema({
+  approvalStatus: {type:String,enum:['NONE','PENDING_APPROVAL','APPROVED','REJECTED','RELEASED'],default:'NONE'},
   requestedAt: { type: Date, default: null },
   requestedBy: { type: String, default: null },
   scheduledDate: { type: String, default: '' },
@@ -99,6 +100,7 @@ const gateOutSchema = new mongoose.Schema({
   releasedAt: { type: Date, default: null },
   releasedBy: { type: String, default: null },
   remarks: { type: String, default: '' },
+  finalDaysInTerminal: {type:Number,default:null},
 }, { _id: false });
 
 const storageSchema = new mongoose.Schema({
@@ -137,7 +139,8 @@ const schema = new mongoose.Schema({
   cargoDescription: String,
   remarks: String,
   documents: [documentSchema],
-  status: { type: String, enum: ['DRAFT', 'SUBMITTED', 'SCHEDULED', 'READY_FOR_GATE_IN', 'GATED_IN', 'COMPLETED', 'CANCELLED'], default: 'SUBMITTED' },
+  status: { type: String, enum: ['DRAFT', 'SUBMITTED', 'REJECTED', 'SCHEDULED', 'READY_FOR_GATE_IN', 'GATED_IN', 'COMPLETED', 'CANCELLED'], default: 'SUBMITTED' },
+  preAdviceReview: { decision: {type:String,enum:['PENDING','APPROVED','REJECTED'],default:'PENDING'},reason:{type:String,default:''},reviewedAt:Date,reviewedBy:{type:mongoose.Schema.Types.ObjectId,ref:'AdminUser'} },
   statusHistory: [historySchema],
   cancellation: {
     cancelledAt: { type: Date, default: null },

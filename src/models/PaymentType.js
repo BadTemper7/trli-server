@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 
-export const PAYMENT_TYPE_CODES = ['CASH', 'BANK', 'E_WALLET'];
+export const PAYMENT_TYPE_CODES = ['CASH', 'BANK', 'GCASH', 'MAYA', 'E_WALLET'];
 
 const schema = new mongoose.Schema({
   code: { type: String, enum: PAYMENT_TYPE_CODES, required: true, unique: true, index: true },

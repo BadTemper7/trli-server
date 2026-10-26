@@ -8,10 +8,11 @@ import { AppError, asyncHandler, ok } from '../utils/http.js';
 import { generateTemporaryPassword } from '../utils/adminPassword.js';
 
 const emailRe=/^\S+@\S+\.\S+$/;
-const safe=(u)=>{const o=u.toObject();delete o.passwordHash;return o};
+const safe=(u)=>{const o=u.toObject();delete o.passwordHash;o.isSystemProtected=isProtectedAdmin(u);return o};
 const accountSetup=(u)=>!u.mustChangePassword?'COMPLETED':(u.temporaryPasswordExpiresAt && u.temporaryPasswordExpiresAt<new Date()?'TEMPORARY_PASSWORD_EXPIRED':'PASSWORD_SETUP_PENDING');
 async function activeSuperCount(){return AdminUser.countDocuments({role:'SUPER_ADMIN',status:'ACTIVE'});}
-function ensureCanTarget(actor,target){if(actor.role!=='SUPER_ADMIN' && target.role==='SUPER_ADMIN')throw new AppError('Only a Super Admin can manage another Super Admin.',403)}
+export function isProtectedAdmin(target){return Boolean(target?.isSystemProtected || (process.env.SUPER_ADMIN_EMAIL && String(target?.email||'').toLowerCase()===process.env.SUPER_ADMIN_EMAIL.trim().toLowerCase() && target?.role==='SUPER_ADMIN'));}
+function ensureCanTarget(actor,target){if(isProtectedAdmin(target))throw new AppError('The designated system Super Admin is read-only in User Management.',403);if(actor.role!=='SUPER_ADMIN' && target.role==='SUPER_ADMIN')throw new AppError('Only a Super Admin can manage another Super Admin.',403)}
 
 export const permissionCatalog=asyncHandler(async(req,res)=>ok(res,{modules:MODULE_ACTIONS}));
 export const listUsers=asyncHandler(async(req,res)=>{
@@ -27,6 +28,7 @@ export const getUser=asyncHandler(async(req,res)=>{const u=await AdminUser.findB
 
 export const createUser=asyncHandler(async(req,res)=>{
   const b=req.body; const role=String(b.role||'ADMIN_USER').toUpperCase(); const status=String(b.status||'ACTIVE').toUpperCase(); const email=String(b.email||'').trim().toLowerCase();
+  if(b.isSystemProtected!==undefined || (process.env.SUPER_ADMIN_EMAIL && email===process.env.SUPER_ADMIN_EMAIL.trim().toLowerCase()))throw new AppError('The protected system identity cannot be created or assigned through User Management.',403);
   if(!b.firstName||!b.lastName||!emailRe.test(email))throw new AppError('First name, last name, and a valid email are required.',400);
   if(!['SUPER_ADMIN','ADMIN_USER'].includes(role)||!['ACTIVE','INACTIVE'].includes(status))throw new AppError('Invalid role or status.',400);
   if(role==='SUPER_ADMIN'&&req.admin.role!=='SUPER_ADMIN')throw new AppError('Only a Super Admin can create another Super Admin.',403);
@@ -81,4 +83,16 @@ export const reissueTemporaryPassword=asyncHandler(async(req,res)=>{
   let emailSent=true,message='A new temporary password has been emailed to the user.';try{const r=await sendAdminTemporaryPassword(user.email,{firstName:user.firstName,email:user.email,temporaryPassword});if(r?.disabled){emailSent=false;message='Temporary password was regenerated, but email delivery is not configured.'}}catch{emailSent=false;message='Temporary password was regenerated, but the login email could not be sent.'}
   emitToAdminUser(user._id,'admin:password-reset-required',{userId:String(user._id)});disconnectAdminUser(user._id);
   ok(res,{user:{...safe(user),accountSetup:accountSetup(user)},emailSent},message);
+});
+
+/** Never allow a protected bootstrap identity to be removed through public admin routes. */
+export const deleteUser = asyncHandler(async (req,res)=>{
+  const user=await AdminUser.findById(req.params.id);
+  if(!user)throw new AppError('Admin user not found.',404);
+  ensureCanTarget(req.admin,user);
+  if(String(user._id)===String(req.admin._id))throw new AppError('You cannot delete your own account.',409);
+  if(user.status!=='INACTIVE')throw new AppError('Deactivate the account before deletion.',409);
+  await auditAdminAction({performedBy:req.admin._id,targetUser:user._id,action:'USER_DELETED',changes:{email:user.email,role:user.role}});
+  await user.deleteOne();
+  ok(res,{id:String(user._id)},'Inactive admin user deleted.');
 });

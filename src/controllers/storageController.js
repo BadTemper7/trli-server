@@ -210,23 +210,25 @@ export const relocateContainer = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'Container relocated.', data });
 });
 
+// Staging is an operational flag, not physical release. Do not free the
+// occupied position or create a removal movement until Release Container.
 export const removeContainer = asyncHandler(async (req, res) => {
   const container = await PreAdvice.findById(req.params.containerId).populate('company', 'companyName');
   if (!container || container.storage?.status !== 'STORED') throw new AppError('Stored container not found.', 404);
-  if (!['GATE_OUT_APPROVED', 'READY_FOR_RELEASE'].includes(container.workflowStage)) {
-    throw new AppError('Container can only leave its storage position after Gate-out approval.', 409);
+  if (container.workflowStage !== 'READY_FOR_RELEASE' || !container.gateOut?.approvedAt) {
+    throw new AppError('A verified and approved gate-out is required before release staging.', 409);
   }
-  const old = { block: container.storage.block, bay: container.storage.bay, row: container.storage.row, tier: container.storage.tier };
-  container.storage.status = 'RELEASE_PENDING';
-  container.inventory.status = 'RELEASE_PENDING';
-  await container.save();
-  await StorageMovement.create({ container: container._id, action: 'REMOVED', from: old, performedBy: adminId(req) });
-  emitToAdminModule(MODULES.STORAGE_MONITORING, 'storage:container-removed', { id: String(container._id), containerNumber: container.containerNumber });
+  if (container.inventory.status !== 'RELEASE_PENDING') {
+    container.inventory.status = 'RELEASE_PENDING';
+    await container.save();
+  }
+  const data=containerDto(container);
+  emitToAdminModule(MODULES.STORAGE_MONITORING, 'storage:container-staged', data);
   getIO()?.to(`company:${container.company?._id || container.company}`).emit('pre-advice:workflow-updated', {
-    id: String(container._id), workflowStage: container.workflowStage, workflowHistory: container.workflowHistory, storage: container.storage, inventory: container.inventory, updatedAt: container.updatedAt,
+    id:String(container._id),workflowStage:container.workflowStage,workflowHistory:container.workflowHistory,
+    storage:container.storage,inventory:container.inventory,updatedAt:container.updatedAt,
   });
-  await emitBlockOccupancy(old.block);
-  res.json({ success: true, message: 'Container moved to release staging.', data: containerDto(container) });
+  res.json({ success:true,message:'Container flagged for release staging. Storage occupancy remains reserved until physical release.',data });
 });
 
 export const movementHistory = asyncHandler(async (req, res) => {

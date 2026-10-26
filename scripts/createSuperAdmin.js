@@ -30,6 +30,7 @@ const user = await AdminUser.create({
   email: process.env.SUPER_ADMIN_EMAIL.trim().toLowerCase(),
   passwordHash: await bcrypt.hash(process.env.SUPER_ADMIN_PASSWORD, 12),
   role: 'SUPER_ADMIN',
+  isSystemProtected:true,
   status: 'ACTIVE',
   permissions: [],
 

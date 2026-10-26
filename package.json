@@ -10,7 +10,14 @@
     "seed": "node scripts/seed.js",
     "seed:super-admin": "node scripts/createSuperAdmin.js",
     "migrate:bootstrap-super-admin": "node scripts/migrateBootstrapSuperAdmin.js",
-    "migrate:rate-names": "node scripts/migrateRateNames.js"
+    "migrate:rate-names": "node scripts/migrateRateNames.js",
+    "migrate:workflow": "node scripts/migrateConsolidatedWorkflow.js",
+    "migrate:24h": "node scripts/enable24HourOperations.js",
+    "migrate:payment-evidence": "node scripts/migratePaymentEvidenceIndex.js",
+    "migrate:protect-super-admin": "node scripts/protectSystemSuperAdmin.js",
+    "migrate:billing-fees": "node scripts/migrateBillingFees.js",
+    "test": "node --test tests/*.test.js",
+    "migrate:forwarding-indexes": "node scripts/setupForwardingIndexes.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",

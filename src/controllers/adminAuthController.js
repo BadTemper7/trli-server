@@ -8,7 +8,7 @@ import { isStrongPassword } from '../utils/adminPassword.js';
 const secret = () => process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET;
 const cookieOptions = () => ({ httpOnly:true, secure:process.env.NODE_ENV==='production', sameSite:process.env.NODE_ENV==='production'?'none':'lax', maxAge: Number(process.env.ADMIN_SESSION_HOURS || 12)*3600*1000, path:'/' });
 function sign(admin){return jwt.sign({sub:String(admin._id),type:'admin',tv:admin.tokenVersion||0},secret(),{expiresIn:process.env.ADMIN_JWT_EXPIRES_IN||'12h'})}
-function safe(admin){const obj=admin.toObject();delete obj.passwordHash;return obj}
+function safe(admin){const obj=admin.toObject();delete obj.passwordHash;obj.isSystemProtected=Boolean(admin.isSystemProtected||(process.env.SUPER_ADMIN_EMAIL && admin.role==='SUPER_ADMIN' && admin.email===process.env.SUPER_ADMIN_EMAIL.trim().toLowerCase()));return obj}
 
 export const login = asyncHandler(async(req,res)=>{
   const email=String(req.body.email||'').trim().toLowerCase();

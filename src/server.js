@@ -3,6 +3,7 @@ import http from 'http'
 import app from './app.js'
 import { connectDB } from './config/db.js'
 import { initSocket } from './socket/index.js'
+import {drainEmailOutbox} from './services/transactionalMail.js'
 
 const PORT = Number(process.env.PORT || 5000)
 
@@ -27,6 +28,9 @@ function startServer() {
         console.log(`Trans Roadway API listening on port ${PORT}`)
       })
 
+      const mailTimer = setInterval(() => drainEmailOutbox().catch(error => console.error('SMTP outbox retry:',error)), 30000)
+      mailTimer.unref()
+      drainEmailOutbox().catch(error => console.error('SMTP outbox:',error))
       server.on('error', (error) => {
         console.error('HTTP server error:', error)
       })

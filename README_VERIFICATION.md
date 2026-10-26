@@ -1,0 +1,1 @@
+Run `npm install` from `server/` using online package access, configure the environment and MongoDB, then run `npm run check` and `node --test tests/*.test.js`. The test file covers isolated utilities only; it is not proof of a working production workflow. Read ../FINAL_CONSOLIDATED_VERIFICATION.md for blockers and route status.

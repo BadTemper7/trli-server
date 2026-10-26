@@ -1,0 +1,13 @@
+import {Router} from 'express';
+import {adminAuth,requirePasswordChanged} from '../middleware/adminAuth.js';
+import {requirePermission} from '../middleware/requirePermission.js';
+import {validateId} from '../middleware/validateId.js';
+import {MODULES,ACTIONS} from '../constants/permissions.js';
+import {listForwarding,getForwarding,createForwarding,gateOutForwarding} from '../controllers/forwardingController.js';
+const router=Router();
+router.use(adminAuth,requirePasswordChanged);
+router.get('/',requirePermission(MODULES.FORWARDING,ACTIONS.VIEW),listForwarding);
+router.post('/',requirePermission(MODULES.FORWARDING,ACTIONS.CREATE),createForwarding);
+router.get('/:id',validateId(),requirePermission(MODULES.FORWARDING,ACTIONS.VIEW),getForwarding);
+router.post('/:id/gate-out',validateId(),requirePermission(MODULES.FORWARDING,ACTIONS.PROCESS),gateOutForwarding);
+export default router;
