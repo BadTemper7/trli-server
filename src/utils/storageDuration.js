@@ -9,7 +9,7 @@ const MANILA_OFFSET_MS = 8 * 60 * 60 * 1000;
 
 export const STORAGE_ROUNDING = Object.freeze({
   CALENDAR_DAYS: 'CALENDAR_DAYS',
-  CEIL_24_HOURS: 'CEIL_24_HOURS', // Legacy contractual option only.
+  CEIL_24_HOURS: 'CEIL_24_HOURS', // Preserved for historical compatibility; new invoices always use CALENDAR_DAYS.
 });
 
 function validInstant(value, name) {
@@ -35,6 +35,22 @@ export function manilaScheduledInstant(day, time) {
     throw new Error('Invalid scheduled Gate-out calendar date.');
   }
   return instant;
+}
+
+/**
+ * Gate-out uses a full Asia/Manila calendar date and an hour on that date.
+ * 00:00 on Oct 27 is the START of Oct 27, not midnight after Oct 27.
+ * Reject reversed schedules rather than silently moving a paid booking.
+ */
+export function requireGateOutAfterGateIn(gateInAt, day, time) {
+  const actualGateIn = validInstant(gateInAt, 'actual Gate-in time');
+  const scheduledGateOut = manilaScheduledInstant(day, time);
+  if (scheduledGateOut <= actualGateIn) {
+    const localIn = new Date(actualGateIn.getTime() + MANILA_OFFSET_MS).toISOString().slice(0, 16);
+    const dayAfter = new Date(Date.parse(`${localIn.slice(0, 10)}T00:00:00Z`) + MS_PER_DAY).toISOString().slice(0, 10);
+    throw new Error(`Gate-out ${day} ${time} must be later than actual Gate-in ${localIn.replace('T', ' ')} (Asia/Manila). For the next midnight choose ${dayAfter} 00:00.`);
+  }
+  return scheduledGateOut;
 }
 
 /** Storage days from physical Gate-in to a quote time, now, or actual release. */

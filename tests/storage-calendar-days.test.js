@@ -33,7 +33,7 @@ test('a quote uses selected scheduled Gate-out calendar day, not current time', 
   assert.equal(billableStorageDays(inAt,'2026-10-28','01:00',new Date('2030-01-01T00:00:00Z')),2);
   assert.equal(billableStorageDays(inAt,null,null,new Date('2026-10-27T17:00:00Z')),2);
 });
-test('legacy 24-hour counting remains an explicit configurable contractual option', () => {
+test('legacy 24-hour utility remains available for historical data compatibility', () => {
   assert.equal(storageDaysBetween(inAt,outAt,'CEIL_24_HOURS'),1);
   assert.equal(billableStorageDays(inAt,'2026-10-28','01:00',new Date(),'CEIL_24_HOURS'),1);
 });

@@ -6,7 +6,7 @@ test('Calendar storage is the default for new company settings and approved invo
  const settings=content('../src/models/SiteSettings.js');
  const calculator=content('../src/utils/billingMath.js');
  assert.match(settings,/default:'CALENDAR_DAYS'/);
- assert.match(calculator,/storageBilling\?\.rounding \|\| 'CALENDAR_DAYS'/);
+ assert.match(calculator,/now, 'CALENDAR_DAYS'/);
 });
 test('Physical release freezes final days using actual Gate-in and actual Gate-out timestamps',()=>{
  const operations=content('../src/controllers/operationsController.js');

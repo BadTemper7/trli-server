@@ -1,4 +1,4 @@
-import { manilaScheduledInstant, storageDaysBetween } from './storageDuration.js';
+import { requireGateOutAfterGateIn, storageDaysBetween } from './storageDuration.js';
 
 /** All currency amounts are server-computed and rounded to PHP centavos. */
 export const money = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
@@ -24,7 +24,7 @@ export function overtimeApplies(time, settings = {}) {
 export function billableStorageDays(actualGateInAt, scheduledDate, scheduledTime, asOf = new Date(), rounding = 'CALENDAR_DAYS') {
   if (!actualGateInAt) return 0;
   const gateOutAt = scheduledDate && scheduledTime
-    ? manilaScheduledInstant(scheduledDate, scheduledTime)
+    ? requireGateOutAfterGateIn(actualGateInAt, scheduledDate, scheduledTime)
     : asOf;
   return storageDaysBetween(actualGateInAt, gateOutAt, rounding);
 }
@@ -127,7 +127,7 @@ export function totalsForLines(lines, vatRate = 12, vatInclusive = false) {
 export function priceLines(rates, booking, type, settings, now = new Date(), optionalRateIds = []) {
   if (!['GATE_IN', 'GATE_OUT'].includes(type)) throw new Error('Invalid billing collection point.');
   const days = type === 'GATE_OUT'
-    ? billableStorageDays(booking.gateIn?.actualGateInAt, booking.gateOut?.scheduledDate, booking.gateOut?.scheduledTime, now, settings.storageBilling?.rounding || 'CALENDAR_DAYS')
+    ? billableStorageDays(booking.gateIn?.actualGateInAt, booking.gateOut?.scheduledDate, booking.gateOut?.scheduledTime, now, 'CALENDAR_DAYS')
     : 1;
   const applicable = pickApplicableRates(allowedRatesForCollection(rates,type), booking);
   const lines = applicable.filter(r => !['Overtime', 'Shifting Fee'].includes(r.name) && rateBillingMode(r) === 'AUTOMATIC')

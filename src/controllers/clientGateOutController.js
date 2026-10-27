@@ -12,6 +12,7 @@ import {AppError,asyncHandler} from '../utils/http.js';
 import {advanceWorkflow} from '../utils/preAdviceWorkflow.js';
 import {calculateInvoice,availableOptionalCharges,previewGateOutTransactions} from '../services/invoicingService.js';
 import {parseOptionalRateIds} from '../utils/billingMath.js';
+import {requireGateOutAfterGateIn} from '../utils/storageDuration.js';
 import {nextReference} from '../utils/referenceNumbers.js';
 import {auditAdminAction} from '../services/adminAuditService.js';
 import {enqueueBookingMail} from '../services/transactionalMail.js';
@@ -21,6 +22,11 @@ import {emitToAdminModule,getIO} from '../socket/index.js';
 import {MODULES} from '../constants/permissions.js';
 
 const stages=['GATE_OUT_REQUESTED','GATE_OUT_PAYMENT_SUBMITTED'];
+function validateGateOutAfterArrival(booking, day, hour) {
+  if (!booking.gateIn?.actualGateInAt) throw new AppError('Actual Gate-in time is required before scheduling Gate-out.', 409);
+  try { requireGateOutAfterGateIn(booking.gateIn.actualGateInAt, day, hour); }
+  catch (error) { throw new AppError(error.message, 400); }
+}
 /** Client-owned, read-only preview of configured Gate-out transactions. */
 export const listClientGateOutTransactions=asyncHandler(async(req,res)=>{
  const booking=await PreAdvice.findOne({_id:req.params.id,company:req.user.company._id}).lean();
@@ -37,6 +43,7 @@ export const quoteClientGateOut=asyncHandler(async(req,res)=>{
  if(b.workflowStage!=='STORAGE'||b.storage?.status!=='STORED')throw new AppError('Only stored containers can request gate-out.',409);
  const day=String(req.query.date||''),hour=String(req.query.time||'');
  if(!day||!hour)throw new AppError('Select a gate-out date and time.',400);
+ validateGateOutAfterArrival(b,day,hour);
  await validateSlot(day,hour);
  const selected=parseOptionalRateIds(req.query.optionalRateIds);
  const quote=await calculateInvoice({...b,gateOut:{...b.gateOut,scheduledDate:day,scheduledTime:hour}},'GATE_OUT',{optionalRateIds:selected});
@@ -49,12 +56,13 @@ export const requestClientGateOut=asyncHandler(async(req,res)=>{
  try{
   await validateUploadedProof(file);
   const day=String(req.body.scheduledDate||''),hour=String(req.body.scheduledTime||'');
-  await validateSlot(day,hour);
   const method=String(req.body.method||'').toUpperCase(),reference=String(req.body.reference||'').trim();
   validatePaymentEvidence(reference,file);
   const receivingMethod = await getReceivingMethod(method);
   const booking=await PreAdvice.findOne({_id:req.params.id,company:req.user.company._id});
   if(!booking)throw new AppError('Booking not found.',404);
+  validateGateOutAfterArrival(booking,day,hour);
+  await validateSlot(day,hour);
   if(booking.workflowStage!=='STORAGE'||booking.storage?.status!=='STORED'||booking.gateOut?.approvedAt||booking.gateOut?.releasedAt)throw new AppError('Container is not eligible or already has an active request.',409);
   const raw=booking.toObject();const optionalRateIds=parseOptionalRateIds(req.body.optionalRateIds);
   const quote=await calculateInvoice({...raw,gateOut:{...raw.gateOut,scheduledDate:day,scheduledTime:hour}},'GATE_OUT',{optionalRateIds});
