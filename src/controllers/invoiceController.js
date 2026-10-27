@@ -130,8 +130,19 @@ export const reviewPayment = asyncHandler(async (req,res) => {
   res.json({success:true,message:decision==='APPROVE'?'Gate-in payment verified.':'Payment rejected; client may submit replacement proof.',data:{payment}});
 });
 export const listPendingPayments = asyncHandler(async (req,res) => {
-  const gateInInvoices=await Invoice.find({type:'GATE_IN',status:'PAYMENT_SUBMITTED'}).distinct('_id');
-  const items=await PaymentSubmission.find({invoice:{$in:gateInInvoices},status:'PENDING_VERIFICATION'}).populate('invoice','number type total').populate('company','companyName').sort({createdAt:1}).limit(300).lean();
+  // Gate-in owns verification. Allow the drawer to request only its booking so
+  // the payment isn't hidden behind the general queue's 300-row limit.
+  const filter={status:'PENDING_VERIFICATION'};
+  if (req.query.booking) {
+    if (!mongoose.isValidObjectId(req.query.booking)) throw new AppError('Invalid booking identifier.',400);
+    filter.booking=req.query.booking;
+  }
+  const invoices=await Invoice.find({type:'GATE_IN',status:'PAYMENT_SUBMITTED'}).distinct('_id');
+  filter.invoice={$in:invoices};
+  const items=await PaymentSubmission.find(filter)
+    .populate('invoice','number type total')
+    .populate('company','companyName')
+    .sort({createdAt:1}).limit(300).lean();
   res.json({success:true,data:{items}});
 });
 export const proofFile = asyncHandler(async (req,res) => {

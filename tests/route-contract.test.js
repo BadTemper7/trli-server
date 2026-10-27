@@ -27,11 +27,17 @@ test('financial PDFs and private payment proofs are route-protected',()=>{
  assert.match(client,/clientInvoices\.get\('\/payments\/:id\/proof',proofFile\)/);
  assert.match(client,/adminInvoices\.use\(adminAuth,requirePasswordChanged\)/);
 });
-test('physical gate-in is guarded by paid invoice and accepted inspection',()=>{
+test('physical gate-in verifies payment and accepts inspection atomically with entry',()=>{
  const ctl=read('../src/controllers/operationsController.js');
- assert.match(ctl,/item\.gateIn\?\.inspection\?\.status!=='ACCEPTED'/);
- assert.match(ctl,/type:'GATE_IN',status:'PAID',balance:0/);
- assert.match(ctl,/if\(item\.gateIn\.actualGateInAt\)/);
+ const fn=ctl.split('export const processGateIn =')[1].split('export const listInventory =')[0];
+ assert.match(fn,/session\.withTransaction/);
+ assert.match(fn,/type:'GATE_IN',status:'PAID',balance:0/);
+ assert.match(fn,/payment\?\.status!=='VERIFIED'/);
+ assert.match(fn,/parseGateInInspection/);
+ assert.match(fn,/item\.gateIn\.inspection=inspection/);
+ assert.match(fn,/item\.gateIn\.actualGateInAt=now/);
+ assert.match(fn,/if\(item\.gateIn\.actualGateInAt\)/);
+ assert.match(fn,/await item\.save\(\{session\}\)/);
 });
 test('combined gate-out verifies payment before final approval in one transaction',()=>{
  const ctl=read('../src/controllers/clientGateOutController.js');

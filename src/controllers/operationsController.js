@@ -15,10 +15,10 @@ import {buildInvoice,requirePaid} from '../services/invoicingService.js';
 import {reserveSlot,releaseSlot} from '../utils/bookingSlots.js';
 import {enqueueBookingMail} from '../services/transactionalMail.js';
 import mongoose from 'mongoose';
+import { parseGateInInspection } from '../utils/gateInInspection.js';
 
 const adminId = (req) => String(req.admin?._id || req.admin?.id || 'admin');
 
-const INSPECTION_CONDITIONS = ['GOOD', 'DENTED', 'RUST', 'HOLE', 'DOOR DAMAGE', 'OTHER'];
 const CONTAINER_TYPES = ['DRY CONTAINER', 'REEFER', 'TANK CONTAINER', 'OPEN TOP', 'FLAT RACK'];
 
 function applyInspectionCorrections(item, corrections = {}) {
@@ -325,32 +325,15 @@ export const inspectGateIn = asyncHandler(async (req, res) => {
   if (!['READY_FOR_GATE_IN','GATE_IN_PAYMENT_SUBMITTED'].includes(item.workflowStage)) throw new AppError('Inspection is only available before physical gate-in.', 409);
   if (item.gateIn?.payment?.submittedAt && req.body?.corrections && Object.keys(req.body.corrections).length) throw new AppError('Container and rate-driving details cannot be changed after online payment submission. Contact billing support for a formal adjustment.', 409);
 
+  // A successful inspection is committed together with physical entry by
+  // POST /gate-in/:id/process. This endpoint is kept for inspection rejection.
   const status = String(req.body?.status || '').trim().toUpperCase();
-  if (!['ACCEPTED', 'REJECTED'].includes(status)) throw new AppError('Inspection status must be ACCEPTED or REJECTED.', 400);
-  const sealNumber = String(req.body?.sealNumber || '').trim().slice(0, 120);
-  if (!sealNumber) throw new AppError('Seal number is required.', 400);
-  if (typeof req.body?.sealIntact !== 'boolean') throw new AppError('Seal intact selection is required.', 400);
-  const rawConditions = Array.isArray(req.body?.containerCondition) ? req.body.containerCondition : [req.body?.containerCondition];
-  const containerCondition = [...new Set(rawConditions.map((value) => String(value || '').trim().toUpperCase()).filter(Boolean))];
-  if (!containerCondition.length) throw new AppError('Select at least one container condition.', 400);
-  if (containerCondition.some((value) => !INSPECTION_CONDITIONS.includes(value))) throw new AppError('Select valid container conditions.', 400);
-  if (containerCondition.includes('GOOD') && containerCondition.length > 1) throw new AppError('GOOD cannot be combined with damage conditions.', 400);
-  const remarks = String(req.body?.remarks || '').trim().slice(0, 1000);
-  const rejectionReason = String(req.body?.rejectionReason || '').trim().slice(0, 1000);
-  if (status === 'REJECTED' && !rejectionReason) throw new AppError('Rejection reason is required when inspection is rejected.', 400);
-
-  const corrections = applyInspectionCorrections(item, req.body?.corrections || {});
+  if (status === 'ACCEPTED') throw new AppError('Use Confirm Physical Gate-in to accept the inspection and record entry together.', 409);
   const now = new Date();
-  item.gateIn.inspection = {
-    status,
-    sealNumber,
-    sealIntact: req.body.sealIntact,
-    containerCondition,
-    remarks,
-    rejectionReason: status === 'REJECTED' ? rejectionReason : '',
-    inspectedAt: now,
-    inspectedBy: adminId(req),
-  };
+  const checked = parseGateInInspection(req.body, adminId(req), now);
+  const { sealNumber, sealIntact, containerCondition, remarks, rejectionReason } = checked;
+  const corrections = applyInspectionCorrections(item, req.body?.corrections || {});
+  item.gateIn.inspection = checked;
 
   // Rate-driving corrections can change the Gate-in amount due.
   const invoice=await buildInvoice(item,'GATE_IN');
@@ -358,7 +341,7 @@ export const inspectGateIn = asyncHandler(async (req, res) => {
   await item.save();
   await auditAdminAction({
     performedBy: req.admin._id,
-    action: status === 'ACCEPTED' ? 'GATE_IN_INSPECTION_ACCEPTED' : 'GATE_IN_INSPECTION_REJECTED',
+    action: 'GATE_IN_INSPECTION_REJECTED',
     changes: {
       bookingReference: item.bookingReference,
       containerNumber: item.containerNumber,
@@ -373,14 +356,12 @@ export const inspectGateIn = asyncHandler(async (req, res) => {
     item,
     MODULES.GATE_IN,
     'gate-in:inspection-updated',
-    status === 'ACCEPTED' ? 'Gate-in Inspection Accepted' : 'Gate-in Inspection Requires Attention',
-    status === 'ACCEPTED'
-      ? `${item.containerNumber} passed Gate-in inspection.`
-      : `${item.containerNumber} was rejected during Gate-in inspection: ${rejectionReason}`,
+    'Gate-in Inspection Requires Attention',
+    `${item.containerNumber} was rejected during Gate-in inspection: ${rejectionReason}`,
   );
   res.json({
     success: true,
-    message: status === 'ACCEPTED' ? 'Inspection accepted. Payment can now be collected.' : 'Inspection rejected. Payment is blocked until the container is accepted.',
+    message: 'Inspection rejected. Physical Gate-in is blocked. The inspection may be repeated after the issue is resolved.',
     data: itemDto(item, { gateInCharges: await paymentSummary(item,'GATE_IN') }),
   });
 });
@@ -461,34 +442,45 @@ export const cancelGateInPayment = asyncHandler(async (req, res) => {
 });
 
 export const processGateIn = asyncHandler(async (req,res) => {
+  // One atomic operation: accept the actual inspection and confirm physical
+  // Gate-in. A verified online payment must already exist; no intermediate
+  // ACCEPTED state is committed if Gate-in cannot complete.
   const session=await mongoose.startSession();
   let id;
   try{
     await session.withTransaction(async()=>{
       const item=await PreAdvice.findOne({_id:req.params.id,workflowStage:{$in:['READY_FOR_GATE_IN','GATE_IN_PAYMENT_SUBMITTED']}}).session(session);
       if(!item)throw new AppError('Booking was already gated in or is not approved.',409);
-      if(item.gateIn?.inspection?.status!=='ACCEPTED')throw new AppError('Gate-in inspection must be accepted.',409);
       const Invoice=(await import('../models/Invoice.js')).default;
       const paid=await Invoice.findOne({booking:item._id,type:'GATE_IN',status:'PAID',balance:0}).session(session);
-      if(!paid)throw new AppError('Gate-in payment is not verified.',409);
+      if(!paid || item.gateIn?.payment?.status!=='VERIFIED')throw new AppError('Gate-in payment must be verified before confirming physical entry.',409);
       if(item.gateIn.actualGateInAt)throw new AppError('Container was already gated in.',409);
+      if(!req.body?.inspection || typeof req.body.inspection !== 'object') throw new AppError('Complete the arrival inspection before confirming physical Gate-in.',400);
       const now=new Date();
-      item.status='GATED_IN';item.statusHistory.push({status:'GATED_IN',changedAt:now,note:String(req.body?.remarks||'')});
+      const inspection=parseGateInInspection({...req.body.inspection,status:'ACCEPTED'},adminId(req),now);
+      // Do not silently alter a settled billing snapshot. Corrections to the
+      // booking must be handled through the documented adjustment workflow.
+      const proposed=req.body.inspection.corrections||{};
+      if(proposed && (typeof proposed !== 'object' || Array.isArray(proposed)))throw new AppError('Invalid booking correction details.',400);
+      const changed=Object.entries(proposed).filter(([field,value])=>String(item[field]??'')!==String(value??''));
+      if(changed.length)throw new AppError('Booking details cannot be changed after payment verification. Contact billing for an adjustment before Gate-in.',409);
+      item.gateIn.inspection=inspection;
+      item.status='GATED_IN';item.statusHistory.push({status:'GATED_IN',changedAt:now,note:String(req.body?.remarks||'').slice(0,500)});
       item.gateIn.actualGateInAt=now;item.gateIn.processedBy=adminId(req);item.gateIn.remarks=String(req.body?.remarks||'').slice(0,500);
       item.inventory.status='IN_YARD';item.inventory.receivedAt=now;item.inventory.receivedBy=adminId(req);
-      item.inventory.condition=[...(item.gateIn.inspection.containerCondition||[])];
-      item.inventory.sealNumber=item.gateIn.inspection.sealNumber||'';
+      item.inventory.condition=[...inspection.containerCondition];
+      item.inventory.sealNumber=inspection.sealNumber;
       item.storage.status='WAITING_STORAGE';
-      advanceWorkflow(item,['GATE_IN','INVENTORY'],{changedAt:now,note:'Physical gate-in confirmed'});
+      advanceWorkflow(item,['GATE_IN','INVENTORY'],{changedAt:now,note:'Inspection accepted and physical Gate-in confirmed'});
       await item.save({session});id=item._id;
     });
   }finally{await session.endSession();}
   const item=await findItem(id);
-  await auditAdminAction({performedBy:req.admin._id,action:'CONTAINER_GATED_IN',changes:{bookingReference:item.bookingReference}});
-  const data=await notifyWorkflow(item,MODULES.GATE_IN,'gate-in:completed','Container Gated In',`${item.containerNumber} entered the terminal and is now in inventory.`);
+  await auditAdminAction({performedBy:req.admin._id,action:'CONTAINER_GATED_IN',changes:{bookingReference:item.bookingReference,inspectionAccepted:true}});
+  const data=await notifyWorkflow(item,MODULES.GATE_IN,'gate-in:completed','Container Gated In',`${item.containerNumber} passed inspection and entered the terminal.`);
   emitToAdminModule(MODULES.INVENTORY,'inventory:updated',data);
   emitToAdminModule(MODULES.STORAGE_MONITORING,'storage:waiting-updated',data);
-  res.json({success:true,message:'Gate-in confirmed; container added to inventory.',data});
+  res.json({success:true,message:'Inspection accepted and physical Gate-in confirmed; container added to inventory.',data});
 });
 
 export const listInventory = asyncHandler(async (req, res) => {
