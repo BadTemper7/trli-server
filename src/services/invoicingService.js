@@ -3,7 +3,7 @@ import Rate from '../models/Rate.js';
 import SiteSettings from '../models/SiteSettings.js';
 import {nextReference} from '../utils/referenceNumbers.js';
 import {AppError} from '../utils/http.js';
-import {priceLines, getOptionalRateChoices, optionalPriceLines, parseOptionalRateIds, totalsForLines} from '../utils/billingMath.js';
+import {priceLines, getOptionalRateChoices, optionalPriceLines, parseOptionalRateIds, totalsForLines, gateOutTransactionPreview} from '../utils/billingMath.js';
 
 async function activeRates(type, session = null) {
   const query = Rate.find({status:'ACTIVE',collectionPoint:type,$or:[{effectiveFrom:null},{effectiveFrom:{$exists:false}},{effectiveFrom:{$lte:new Date()}}]});
@@ -13,14 +13,38 @@ export async function availableOptionalCharges(booking, type, session = null) {
   try { return getOptionalRateChoices(await activeRates(type, session), booking,type); }
   catch(error) { throw new AppError(error.message,409); }
 }
+/** Show current matching Gate-out transactions before scheduling; never substitutes for a quote. */
+export async function previewGateOutTransactions(booking) {
+  try {
+    return gateOutTransactionPreview(await activeRates('GATE_OUT'), booking);
+  } catch (error) {
+    throw new AppError(error.message,409);
+  }
+}
+
 export async function calculateInvoice(booking,type,options={}) {
   if(!['GATE_IN','GATE_OUT'].includes(type))throw new AppError('Invalid invoice type.',400);
   const settings=await SiteSettings.findOne({key:'COMPANY_CONTACT'}).lean()||{};
   const rates=await activeRates(type);
   try {
+    // A stored container must have its contracted Storage charge configured.
+    // Otherwise a quote containing only an optional service or OT could be
+    // accepted, silently undercharging the entire stay.
+    if (type === 'GATE_OUT') {
+      const available = gateOutTransactionPreview(rates, booking);
+      if (!available.hasStorageRate) {
+        const details = `${booking.transactionClassification || 'Unspecified'} / ${booking.containerType === 'REEFER' ? 'REEFER' : 'STANDARD'} / ${booking.loadStatus || 'Unspecified load'} / ${booking.containerSize || 'Unspecified size'}`;
+        throw new AppError(`No active Gate-out Storage transaction matches ${details}. Ask the terminal administrator to configure a Storage rate with Collect At: Gate-out.`, 409);
+      }
+    }
     const ids = parseOptionalRateIds(options.optionalRateIds || []);
     const quoted=priceLines(rates,booking,type,settings,new Date(),ids);
-    if(!quoted.lines.length)throw new AppError(`No ${type} rate is configured for this container; contact the terminal administrator.`,409);
+    if (!quoted.lines.length) {
+      const className=String(booking.transactionClassification || 'Unspecified');
+      const category=booking.containerType==='REEFER'?'REEFER':'STANDARD';
+      const details=`${className} / ${category} / ${booking.loadStatus || 'Unspecified load'} / ${booking.containerSize || 'Unspecified size'}`;
+      throw new AppError(`No ${type === 'GATE_OUT' ? 'Gate-out' : 'Gate-in'} transactions are configured for ${details}. Ask an administrator to configure matching ACTIVE rates with Collect At: ${type === 'GATE_OUT' ? 'Gate-out' : 'Gate-in'}.`,409);
+    }
     return {...quoted,optionalRateIds:ids,balance:quoted.total};
   } catch(err) { if(err instanceof AppError)throw err;throw new AppError(err.message,409); }
 }

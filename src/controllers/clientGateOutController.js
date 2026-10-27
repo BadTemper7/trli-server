@@ -10,7 +10,7 @@ import { getReceivingMethod, receivingAccountSnapshot } from '../services/paymen
 import {reserveSlot,releaseSlot,validateSlot} from '../utils/bookingSlots.js';
 import {AppError,asyncHandler} from '../utils/http.js';
 import {advanceWorkflow} from '../utils/preAdviceWorkflow.js';
-import {calculateInvoice,availableOptionalCharges} from '../services/invoicingService.js';
+import {calculateInvoice,availableOptionalCharges,previewGateOutTransactions} from '../services/invoicingService.js';
 import {parseOptionalRateIds} from '../utils/billingMath.js';
 import {nextReference} from '../utils/referenceNumbers.js';
 import {auditAdminAction} from '../services/adminAuditService.js';
@@ -21,6 +21,16 @@ import {emitToAdminModule,getIO} from '../socket/index.js';
 import {MODULES} from '../constants/permissions.js';
 
 const stages=['GATE_OUT_REQUESTED','GATE_OUT_PAYMENT_SUBMITTED'];
+/** Client-owned, read-only preview of configured Gate-out transactions. */
+export const listClientGateOutTransactions=asyncHandler(async(req,res)=>{
+ const booking=await PreAdvice.findOne({_id:req.params.id,company:req.user.company._id}).lean();
+ if(!booking)throw new AppError('Booking not found.',404);
+ if(booking.workflowStage!=='STORAGE'||booking.storage?.status!=='STORED'||booking.gateOut?.releasedAt)
+   throw new AppError('Only stored and unreleased containers can review a new Gate-out quotation.',409);
+ const transactions=await previewGateOutTransactions(booking);
+ res.json({success:true,data:{transactions,classification:booking.transactionClassification,loadStatus:booking.loadStatus,containerSize:booking.containerSize,containerCategory:booking.containerType==='REEFER'?'REEFER':'STANDARD'}});
+});
+
 export const quoteClientGateOut=asyncHandler(async(req,res)=>{
  const b=await PreAdvice.findOne({_id:req.params.id,company:req.user.company._id}).lean();
  if(!b)throw new AppError('Booking not found.',404);

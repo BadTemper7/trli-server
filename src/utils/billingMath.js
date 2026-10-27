@@ -64,6 +64,28 @@ export function getOptionalRateChoices(rates, booking, type = null) {
     .map(r => ({ id: String(r._id), name: r.name, description: r.description || '', amount: money(r.amount), taxTreatment: r.taxTreatment || 'TAXABLE' }));
 }
 
+/**
+ * Client-facing preview of exactly the currently applicable Gate-out tariff
+ * entries.  This is NOT an invoice or payment amount: quantities (especially
+ * calendar-day storage and conditional overtime) are calculated by priceLines
+ * only after a valid scheduled Gate-out time has been selected.
+ */
+export function gateOutTransactionPreview(rates, booking) {
+  const matches = pickApplicableRates(allowedRatesForCollection(rates, 'GATE_OUT'), booking);
+  const toItem = rate => ({
+    id: String(rate._id),
+    name: rate.name === 'Other' && rate.description ? rate.description : rate.name,
+    description: rate.description || '',
+    amount: money(rate.amount),
+    taxTreatment: rate.taxTreatment || 'TAXABLE',
+    basis: rate.name === 'Storage' ? 'PER_CALENDAR_DAY' : rate.name === 'Overtime' ? 'CONDITIONAL_OVERTIME' : 'PER_TRANSACTION',
+    isOptional: rateBillingMode(rate) === 'OPTIONAL',
+  });
+  const automatic = matches.filter(rate => rateBillingMode(rate) === 'AUTOMATIC' && rate.name !== 'Shifting Fee').map(toItem);
+  const optional = matches.filter(rate => rateBillingMode(rate) === 'OPTIONAL').map(toItem);
+  return { automatic, optional, hasBaseCharge: automatic.some(item => item.basis !== 'CONDITIONAL_OVERTIME'), hasStorageRate: automatic.some(item => item.basis === 'PER_CALENDAR_DAY') };
+}
+
 export function parseOptionalRateIds(value) {
   let values = value;
   if (typeof values === 'string') {
