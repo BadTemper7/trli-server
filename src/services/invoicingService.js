@@ -6,7 +6,7 @@ import {AppError} from '../utils/http.js';
 import {priceLines, getOptionalRateChoices, optionalPriceLines, parseOptionalRateIds, totalsForLines, gateOutTransactionPreview} from '../utils/billingMath.js';
 
 async function activeRates(type, session = null) {
-  const query = Rate.find({status:'ACTIVE',collectionPoint:type,$or:[{effectiveFrom:null},{effectiveFrom:{$exists:false}},{effectiveFrom:{$lte:new Date()}}]});
+  const query = Rate.find({status:'ACTIVE',collectionPoint:{$in:[type,'BOTH']},$or:[{effectiveFrom:null},{effectiveFrom:{$exists:false}},{effectiveFrom:{$lte:new Date()}}]});
   return (session ? query.session(session) : query).lean();
 }
 export async function availableOptionalCharges(booking, type, session = null) {
@@ -16,7 +16,7 @@ export async function availableOptionalCharges(booking, type, session = null) {
 /** Show current matching Gate-out transactions before scheduling; never substitutes for a quote. */
 export async function previewGateOutTransactions(booking) {
   try {
-    return gateOutTransactionPreview(await activeRates('GATE_OUT'), booking);
+    return gateOutTransactionPreview(await activeRates('GATE_OUT'), booking, await SiteSettings.findOne({key:'COMPANY_CONTACT'}).lean() || {});
   } catch (error) {
     throw new AppError(error.message,409);
   }
@@ -31,7 +31,7 @@ export async function calculateInvoice(booking,type,options={}) {
     // Otherwise a quote containing only an optional service or OT could be
     // accepted, silently undercharging the entire stay.
     if (type === 'GATE_OUT') {
-      const available = gateOutTransactionPreview(rates, booking);
+      const available = gateOutTransactionPreview(rates, booking, settings);
       if (!available.hasStorageRate) {
         const details = `${booking.transactionClassification || 'Unspecified'} / ${booking.containerType === 'REEFER' ? 'REEFER' : 'STANDARD'} / ${booking.loadStatus || 'Unspecified load'} / ${booking.containerSize || 'Unspecified size'}`;
         throw new AppError(`No active Gate-out Storage transaction matches ${details}. Ask the terminal administrator to configure a Storage rate with Collect At: Gate-out.`, 409);

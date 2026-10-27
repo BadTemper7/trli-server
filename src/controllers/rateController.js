@@ -6,10 +6,10 @@ import { AUTOMATIC_RATE_NAMES, ALWAYS_OPTIONAL_RATE_NAMES, rateBillingMode } fro
 
 const cleanString = (value, max = 500) => String(value ?? '').trim().slice(0, max);
 const allowed = {
-  classification: new Set(['LOCAL', 'INTERNATIONAL']),
-  loadStatus: new Set(['EMPTY', 'LOADED']),
+  classification: new Set(['LOCAL', 'INTERNATIONAL', 'ALL']),
+  loadStatus: new Set(['EMPTY', 'LOADED', 'ALL']),
   containerSize: new Set(['ALL', '20FT', '40FT']),
-  collectionPoint: new Set(['GATE_IN', 'GATE_OUT']),
+  collectionPoint: new Set(['GATE_IN', 'GATE_OUT', 'BOTH']),
   status: new Set(['ACTIVE', 'INACTIVE']),
 };
 
@@ -44,12 +44,17 @@ function enumValue(name, value, fallback) {
 function cleanRateInput(body = {}) {
   const name = normalizeRateName(body.name, body);
   if (!RATE_NAMES.includes(name)) throw new AppError('Select a valid rate name.', 400);
-  const category=String(body.containerCategory||'STANDARD').toUpperCase(),tax=String(body.taxTreatment||'TAXABLE').toUpperCase();
-  if(!['STANDARD','REEFER'].includes(category)||!['TAXABLE','EXEMPT','ZERO_RATED'].includes(tax))throw new AppError('Invalid container category or tax treatment.',400);
-  if(category==='REEFER'&&String(body.loadStatus).toUpperCase()==='LOADED')throw new AppError('Loaded reefer rates are unsupported.',400);
+  const category = String(body.containerCategory || (name === 'Overtime' ? 'ALL' : 'STANDARD')).toUpperCase();
+  const tax = String(body.taxTreatment || 'TAXABLE').toUpperCase();
+  if (!['STANDARD','REEFER','ALL'].includes(category) || !['TAXABLE','EXEMPT','ZERO_RATED'].includes(tax)) throw new AppError('Invalid container category or tax treatment.',400);
+  const classification = enumValue('classification', body.classification, name === 'Overtime' ? 'ALL' : undefined);
+  const loadStatus = enumValue('loadStatus', body.loadStatus, name === 'Overtime' ? 'ALL' : undefined);
+  const collectionPoint = enumValue('collectionPoint', body.collectionPoint, name === 'Overtime' ? 'BOTH' : undefined);
+  if (name !== 'Overtime' && [classification,loadStatus,category,collectionPoint].includes('ALL')) throw new AppError('All classifications, categories, and load statuses are supported only for Overtime.',400);
+  if (name !== 'Overtime' && collectionPoint === 'BOTH') throw new AppError('Collect at both Gate-in and Gate-out is supported only for Overtime.',400);
+  if (category === 'REEFER' && loadStatus === 'LOADED') throw new AppError('Loaded reefer rates are unsupported.',400);
   const billingMode = AUTOMATIC_RATE_NAMES.includes(name) ? 'AUTOMATIC' : ALWAYS_OPTIONAL_RATE_NAMES.includes(name) ? 'OPTIONAL' : String(body.billingMode || 'OPTIONAL').toUpperCase();
   if (!['AUTOMATIC', 'OPTIONAL'].includes(billingMode)) throw new AppError('Invalid charge mode.',400);
-  const collectionPoint = enumValue('collectionPoint', body.collectionPoint);
   if (['Documentation Fee','Shifting Fee','Gate-in Handling'].includes(name) && collectionPoint !== 'GATE_IN') throw new AppError(`${name} is collected at Gate-in.`,400);
   if (name === 'Gate-out Handling' && collectionPoint !== 'GATE_OUT') throw new AppError('Gate-out Handling is collected at Gate-out.',400);
   if (name === 'Storage' && collectionPoint !== 'GATE_OUT') throw new AppError('Storage is collected at Gate-out.',400);
@@ -62,8 +67,8 @@ function cleanRateInput(body = {}) {
     containerCategory:category,
     taxTreatment:tax,
     billingMode,
-    classification: enumValue('classification', body.classification),
-    loadStatus: enumValue('loadStatus', body.loadStatus),
+    classification,
+    loadStatus,
     containerSize: enumValue('containerSize', body.containerSize, 'ALL'),
     amount: Math.round(amount * 100) / 100,
     collectionPoint,
@@ -105,7 +110,9 @@ export const listRates = asyncHandler(async (req, res) => {
     filter.name = requestedName;
   }
   for (const key of ['classification','loadStatus','containerSize','collectionPoint','status']) {
-    if (req.query[key]) filter[key] = enumValue(key, req.query[key]);
+    if (!req.query[key]) continue;
+    const selected = enumValue(key, req.query[key]);
+    filter[key] = key === 'collectionPoint' && selected !== 'BOTH' ? { $in: [selected, 'BOTH'] } : selected;
   }
   const rows = await Rate.find(filter).sort({ status: 1, name: 1, createdAt: -1 }).lean();
   res.json({ success: true, message: 'Rates loaded.', data: rows.map(dto) });

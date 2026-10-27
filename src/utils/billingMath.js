@@ -14,7 +14,7 @@ export const rateBillingMode = (rate) => AUTOMATIC_RATE_NAMES.includes(rate.name
   : (ALWAYS_OPTIONAL_RATE_NAMES.includes(rate.name) ? 'OPTIONAL' : (rate.billingMode === 'AUTOMATIC' ? 'AUTOMATIC' : 'OPTIONAL'));
 
 export function overtimeApplies(time, settings = {}) {
-  if (!settings.active || !time) return false;
+  if (settings.active === false || !time) return false;
   const { start = '18:00', end = '08:00' } = settings;
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(start) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(end) || start === end) return false;
   // Overnight: 18:00 ... 23:59 and 00:00 ... 07:59 (Asia/Manila time).
@@ -32,26 +32,46 @@ export function billableStorageDays(actualGateInAt, scheduledDate, scheduledTime
 export function allowedRatesForCollection(rates, type) {
   const gateInOnly=new Set(['Gate-in Handling','Shifting Fee','Documentation Fee']);
   const gateOutOnly=new Set(['Gate-out Handling','Storage']);
-  return rates.filter(r => (!r.collectionPoint || r.collectionPoint===type)
+  return rates.filter(r => (!r.collectionPoint || r.collectionPoint===type || (r.name === 'Overtime' && r.collectionPoint === 'BOTH'))
     && !(type==='GATE_IN'&&gateOutOnly.has(r.name))
     && !(type==='GATE_OUT'&&gateInOnly.has(r.name)));
 }
 
-export function pickApplicableRates(rates, booking) {
+/**
+ * Matching uses all-dimension wildcard support only for Overtime. A specific
+ * override beats a universal price; equally specific Gate-in/Gate-out rates
+ * beat a BOTH rate. Exactly one overtime row can be chosen per transaction.
+ */
+export function pickApplicableRates(rates, booking, collectionPoint = null) {
   const category = booking.containerType === 'REEFER' ? 'REEFER' : 'STANDARD';
   if (category === 'REEFER' && booking.loadStatus === 'LOADED') throw new Error('Loaded reefer pricing is unsupported.');
-  const eligible = rates.filter(r => r.status === 'ACTIVE' && (!r.effectiveFrom || new Date(r.effectiveFrom)<=new Date())
-    && r.classification === booking.transactionClassification
-    && r.loadStatus === booking.loadStatus
-    && ['ALL', booking.containerSize].includes(r.containerSize || 'ALL')
-    && (!r.containerCategory || r.containerCategory === category)
-    && r.name !== 'Total Handling Reference');
+  const eligible = rates.filter(r => {
+    if (r.status !== 'ACTIVE' || (r.effectiveFrom && new Date(r.effectiveFrom) > new Date()) || r.name === 'Total Handling Reference') return false;
+    if (r.name === 'Overtime') {
+      return (!collectionPoint || r.collectionPoint === collectionPoint || r.collectionPoint === 'BOTH')
+        && (!r.classification || r.classification === 'ALL' || r.classification === booking.transactionClassification)
+        && (!r.loadStatus || r.loadStatus === 'ALL' || r.loadStatus === booking.loadStatus)
+        && (!r.containerCategory || r.containerCategory === 'ALL' || r.containerCategory === category)
+        && (!r.containerSize || r.containerSize === 'ALL' || r.containerSize === booking.containerSize);
+    }
+    return r.classification === booking.transactionClassification
+      && r.loadStatus === booking.loadStatus
+      && ['ALL', booking.containerSize].includes(r.containerSize || 'ALL')
+      && (!r.containerCategory || r.containerCategory === category);
+  });
   const chosen = new Map();
+  const normalScore = r => (r.containerSize === booking.containerSize ? 2 : 0) + (r.containerCategory === category ? 1 : 0);
+  const overtimeScore = r => {
+    const specifics = [r.classification === booking.transactionClassification, r.containerCategory === category, r.loadStatus === booking.loadStatus, r.containerSize === booking.containerSize];
+    const specificity = specifics.filter(Boolean).length;
+    const collectionBonus = collectionPoint && r.collectionPoint === collectionPoint ? 1 : 0;
+    return specificity * 100 + collectionBonus * 16 + (specifics[0] ? 8 : 0) + (specifics[1] ? 4 : 0) + (specifics[2] ? 2 : 0) + (specifics[3] ? 1 : 0);
+  };
   for (const rate of eligible) {
     const key = rate.name;
     const prev = chosen.get(key);
-    const score = (rate.containerSize === booking.containerSize ? 2 : 0) + (rate.containerCategory === category ? 1 : 0);
-    const prevScore = prev ? ((prev.containerSize === booking.containerSize ? 2 : 0) + (prev.containerCategory === category ? 1 : 0)) : -1;
+    const score = key === 'Overtime' ? overtimeScore(rate) : normalScore(rate);
+    const prevScore = !prev ? -1 : key === 'Overtime' ? overtimeScore(prev) : normalScore(prev);
     if (score > prevScore) chosen.set(key, rate);
     else if (score === prevScore && prev && String(rate._id) !== String(prev._id)) throw new Error(`Duplicate active rate configured: ${rate.name}.`);
   }
@@ -59,7 +79,7 @@ export function pickApplicableRates(rates, booking) {
 }
 
 export function getOptionalRateChoices(rates, booking, type = null) {
-  return pickApplicableRates(type?allowedRatesForCollection(rates,type):rates, booking)
+  return pickApplicableRates(type?allowedRatesForCollection(rates,type):rates, booking, type)
     .filter(r => rateBillingMode(r) === 'OPTIONAL')
     .map(r => ({ id: String(r._id), name: r.name, description: r.description || '', amount: money(r.amount), taxTreatment: r.taxTreatment || 'TAXABLE' }));
 }
@@ -70,8 +90,8 @@ export function getOptionalRateChoices(rates, booking, type = null) {
  * calendar-day storage and conditional overtime) are calculated by priceLines
  * only after a valid scheduled Gate-out time has been selected.
  */
-export function gateOutTransactionPreview(rates, booking) {
-  const matches = pickApplicableRates(allowedRatesForCollection(rates, 'GATE_OUT'), booking);
+export function gateOutTransactionPreview(rates, booking, settings = {}) {
+  const matches = pickApplicableRates(allowedRatesForCollection(rates, 'GATE_OUT'), booking, 'GATE_OUT').filter(rate => settings.overtime?.active !== false || rate.name !== 'Overtime');
   const toItem = rate => ({
     id: String(rate._id),
     name: rate.name === 'Other' && rate.description ? rate.description : rate.name,
@@ -82,6 +102,10 @@ export function gateOutTransactionPreview(rates, booking) {
     isOptional: rateBillingMode(rate) === 'OPTIONAL',
   });
   const automatic = matches.filter(rate => rateBillingMode(rate) === 'AUTOMATIC' && rate.name !== 'Shifting Fee').map(toItem);
+  // Preview the Settings fallback when no explicit matching OT rate exists.
+  if (!matches.some(r => r.name === 'Overtime') && settings.overtime?.active !== false && Number(settings.overtime?.fee) > 0) {
+    automatic.push({ id: 'settings-overtime', name: 'Overtime', description: `Configured universal overtime (${settings.overtime.start || '18:00'}-${settings.overtime.end || '08:00'} Asia/Manila)`, amount: money(settings.overtime.fee), taxTreatment: 'TAXABLE', basis: 'CONDITIONAL_OVERTIME', isOptional: false });
+  }
   const optional = matches.filter(rate => rateBillingMode(rate) === 'OPTIONAL').map(toItem);
   return { automatic, optional, hasBaseCharge: automatic.some(item => item.basis !== 'CONDITIONAL_OVERTIME'), hasStorageRate: automatic.some(item => item.basis === 'PER_CALENDAR_DAY') };
 }
@@ -101,7 +125,7 @@ export function parseOptionalRateIds(value) {
 
 export function optionalPriceLines(rates, booking, selectedRateIds, type = null) {
   const ids = parseOptionalRateIds(selectedRateIds);
-  const applicable = pickApplicableRates(type?allowedRatesForCollection(rates,type):rates, booking).filter(rate => rateBillingMode(rate) === 'OPTIONAL');
+  const applicable = pickApplicableRates(type?allowedRatesForCollection(rates,type):rates, booking, type).filter(rate => rateBillingMode(rate) === 'OPTIONAL');
   const chosen = applicable.filter(rate => ids.includes(String(rate._id)));
   if (chosen.length !== ids.length) throw new Error('Selected optional charge is not active or does not apply to this container.');
   return chosen.map(rate => ({
@@ -129,7 +153,7 @@ export function priceLines(rates, booking, type, settings, now = new Date(), opt
   const days = type === 'GATE_OUT'
     ? billableStorageDays(booking.gateIn?.actualGateInAt, booking.gateOut?.scheduledDate, booking.gateOut?.scheduledTime, now, 'CALENDAR_DAYS')
     : 1;
-  const applicable = pickApplicableRates(allowedRatesForCollection(rates,type), booking);
+  const applicable = pickApplicableRates(allowedRatesForCollection(rates,type), booking, type);
   const lines = applicable.filter(r => !['Overtime', 'Shifting Fee'].includes(r.name) && rateBillingMode(r) === 'AUTOMATIC')
     .map(r => {
       const quantity = r.name === 'Storage' ? days : 1;

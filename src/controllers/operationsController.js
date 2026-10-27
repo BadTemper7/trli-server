@@ -74,9 +74,9 @@ const escapeRx = (value = '') => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\
 async function matchingRates(item, collectionPoint) {
   const rates = await Rate.find({
     status: 'ACTIVE',
-    collectionPoint,
-    classification: item.transactionClassification,
-    loadStatus: item.loadStatus,
+    collectionPoint: { $in: [collectionPoint, 'BOTH'] },
+    classification: { $in: [item.transactionClassification, 'ALL'] },
+    loadStatus: { $in: [item.loadStatus, 'ALL'] },
     containerSize: { $in: ['ALL', item.containerSize] },
   }).sort({ name: 1, createdAt: 1 }).lean();
   return rates.map((r) => ({
