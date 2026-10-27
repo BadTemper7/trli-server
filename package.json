@@ -17,7 +17,8 @@
     "migrate:protect-super-admin": "node scripts/protectSystemSuperAdmin.js",
     "migrate:billing-fees": "node scripts/migrateBillingFees.js",
     "test": "node --test tests/*.test.js",
-    "migrate:forwarding-indexes": "node scripts/setupForwardingIndexes.js"
+    "migrate:forwarding-indexes": "node scripts/setupForwardingIndexes.js",
+    "migrate:storage-calendar": "node scripts/migrateStorageCalendarDays.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",

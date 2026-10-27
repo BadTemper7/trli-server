@@ -40,9 +40,9 @@ test('Gate-out includes fixed Storage and Lift Off; not Gate-in shifting or docu
  const q=priceLines(rates.filter(r=>r.collectionPoint==='GATE_OUT'),booking,'GATE_OUT',settings);
  assert.equal(q.lines.some(r=>r.description==='Shifting Fee'),false);
  assert.equal(q.lines.some(r=>r.description==='Documentation Fee'),false);
- assert.equal(q.lines.find(r=>r.description==='Storage').quantity,2);
+ assert.equal(q.lines.find(r=>r.description==='Storage').quantity,3); // Oct 26, Oct 27 and Oct 28 each count
  assert.equal(q.lines.find(r=>r.description==='Overtime').amount,350);
- assert.equal(q.subtotal,1120); // 500+200+70+350
+ assert.equal(q.subtotal,1220); // 500+300+70+350
 });
 test('A legacy documentation rate accidentally configured at Gate-out is never billable there',()=>{
  const mistaken=rate('7','Documentation Fee',199,'GATE_OUT','OPTIONAL');
@@ -55,7 +55,7 @@ test('Other service may be selected manually at Gate-out with its server rate',(
  assert.equal(getOptionalRateChoices(gateRates,booking).length,1);
  const q=priceLines(gateRates,booking,'GATE_OUT',settings,new Date(),[id('4')]);
  assert.equal(q.lines.find(r=>r.description==='Container sweeping').amount,85);
- assert.equal(q.total,1349.60); // (1120+85)*1.12
+ assert.equal(q.total,1461.60); // (1220+85)*1.12
 });
 test('Optional fee selection rejects inapplicable, cross-point, or repeated IDs',()=>{
  assert.throws(()=>priceLines(rates.filter(r=>r.collectionPoint==='GATE_OUT'),booking,'GATE_OUT',settings,new Date(),[id('c')]),/not active or does not apply/);

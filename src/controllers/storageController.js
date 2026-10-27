@@ -6,6 +6,7 @@ import { getIO, emitToAdminModule } from '../socket/index.js';
 import { MODULES } from '../constants/permissions.js';
 import { AppError, asyncHandler } from '../utils/http.js';
 import { advanceWorkflow, ensureWorkflow } from '../utils/preAdviceWorkflow.js';
+import { storageDaysBetween } from '../utils/storageDuration.js';
 
 const VALID_STATUS = ['ACTIVE', 'INACTIVE', 'MAINTENANCE', 'FULL'];
 const VALID_SIZE = ['20FT', '40FT'];
@@ -148,6 +149,10 @@ function containerDto(c) {
     truckPlateNumber: c.truckPlateNumber, truckPlate: c.truckPlateNumber, driverName: c.driverName, driver: c.driverName,
     hauler: c.hauler, weight: c.weight, cargoDescription: c.cargoDescription || '', remarks: c.remarks || '',
     status: c.status, workflowStage: c.workflowStage, workflowHistory: c.workflowHistory || [], gateIn: c.gateIn || {}, inventory: c.inventory || {}, storage: c.storage || {}, gateOut: c.gateOut || {},
+    daysInTerminal: c.gateIn?.actualGateInAt
+      ? (c.gateOut?.releasedAt && c.gateOut?.finalDaysInTerminal != null
+          ? c.gateOut.finalDaysInTerminal : storageDaysBetween(c.gateIn.actualGateInAt, new Date()))
+      : 0,
     createdAt: c.createdAt, updatedAt: c.updatedAt,
   };
 }

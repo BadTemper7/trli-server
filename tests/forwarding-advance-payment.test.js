@@ -33,10 +33,10 @@ test('Forwarding validation prevents an invalid or future Gate-in calendar date'
  assert.throws(()=>validateForwardingInput({...fields(),gateInDate:'2025-02-31'}),/Invalid gate-in/);
  assert.throws(()=>validateForwardingInput({...fields(),gateInDate:'2099-12-01'}),/future/);
 });
-test('A15 forwarding duration calculates elapsed and rounded-up days',()=>{
+test('A15 forwarding duration preserves actual elapsed hours and counts Manila calendar days',()=>{
  const start=new Date('2026-10-25T00:00:00.000Z');
  assert.deepEqual(terminalDuration(start,new Date('2026-10-26T01:00:00.000Z')),{elapsedHours:25,elapsedDays:1.04,billableDays:2});
- assert.equal(terminalDuration(start,new Date('2026-10-26T00:00:00.000Z')).billableDays,1);
+ assert.equal(terminalDuration(start,new Date('2026-10-26T00:00:00.000Z')).billableDays,2);
 });
 test('Final forwarding duration rejects impossible reversed timestamps',()=>assert.throws(()=>terminalDuration(new Date('2026-10-26'),new Date('2026-10-25')),/after Gate-in/));
 test('Forwarding duplicate active container has a MongoDB unique partial index (static contract)',()=>{

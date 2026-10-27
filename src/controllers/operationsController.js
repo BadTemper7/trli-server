@@ -16,6 +16,8 @@ import {reserveSlot,releaseSlot} from '../utils/bookingSlots.js';
 import {enqueueBookingMail} from '../services/transactionalMail.js';
 import mongoose from 'mongoose';
 import { parseGateInInspection } from '../utils/gateInInspection.js';
+import SiteSettings from '../models/SiteSettings.js';
+import { storageDaysBetween } from '../utils/storageDuration.js';
 
 const adminId = (req) => String(req.admin?._id || req.admin?.id || 'admin');
 
@@ -605,7 +607,8 @@ export const releaseContainer = asyncHandler(async (req,res) => {
       oldStorage=item.storage?.block?{block:item.storage.block,bay:item.storage.bay,row:item.storage.row,tier:item.storage.tier}:null;
       now=new Date();
       item.gateOut.approvalStatus='RELEASED';item.gateOut.releasedAt=now;item.gateOut.releasedBy=adminId(req);
-      item.gateOut.finalDaysInTerminal=Math.max(1,Math.ceil((now.getTime()-new Date(item.gateIn.actualGateInAt).getTime())/86400000));
+      const billingSettings=await SiteSettings.findOne({key:'COMPANY_CONTACT'}).session(session).lean();
+      item.gateOut.finalDaysInTerminal=storageDaysBetween(item.gateIn.actualGateInAt,now,billingSettings?.storageBilling?.rounding || 'CALENDAR_DAYS');
       item.gateOut.remarks=String(req.body?.remarks||item.gateOut.remarks||'').slice(0,500);
       item.inventory.status='RELEASED';item.storage.status='RELEASED';
       item.storage.block=null;item.storage.bay=null;item.storage.row=null;item.storage.tier=null;

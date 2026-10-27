@@ -1,3 +1,5 @@
+import { storageDaysBetween } from './storageDuration.js';
+
 /** Forwarding is a non-financial movement record, distinct from PreAdvice. */
 export const FORWARDING_STATUSES = Object.freeze(['IN_TERMINAL','GATED_OUT']);
 export const FORWARDING_SIZES = Object.freeze(['20FT','40FT','45FT']);
@@ -23,7 +25,7 @@ export function terminalDuration(gateInAt, gateOutAt = new Date()) {
   if (!Number.isFinite(start)||!Number.isFinite(end)||end<start) throw new Error('Gate-out must be at or after Gate-in.');
   const elapsedHours = Math.round((end-start)/36000)/100;
   const elapsedDays = Math.round((end-start)/864000)/100;
-  return {elapsedHours,elapsedDays,billableDays:Math.max(1,Math.ceil((end-start)/86400000))};
+  return {elapsedHours,elapsedDays,billableDays:storageDaysBetween(start,end)};
 }
 
 export function validateForwardingInput(body={}) {

@@ -24,7 +24,7 @@ try {
   const oldSettings = await SiteSettings.findOne({key:'COMPANY_CONTACT'}).lean();
   if(!oldSettings) output('settings',{action:'create default company settings record when applied'});
   if (apply) await SiteSettings.updateOne({key:'COMPANY_CONTACT'}, {
-    $setOnInsert:{key:'COMPANY_CONTACT',schedule:{openingTime:'00:00',closingTime:'24:00',operatingDays:[0,1,2,3,4,5,6],maxBookingsPerHour:4,active:true},shiftingFee:0,tax:{vatRate:12,vatInclusive:false},overtime:{start:'18:00',end:'08:00',fee:0,active:true},storageBilling:{rounding:'CEIL_24_HOURS'}},
+    $setOnInsert:{key:'COMPANY_CONTACT',schedule:{openingTime:'00:00',closingTime:'24:00',operatingDays:[0,1,2,3,4,5,6],maxBookingsPerHour:4,active:true},shiftingFee:0,tax:{vatRate:12,vatInclusive:false},overtime:{start:'18:00',end:'08:00',fee:0,active:true},storageBilling:{rounding:'CALENDAR_DAYS'}},
   },{upsert:true});
 
   const unclassified = await Rate.countDocuments({containerCategory:{$exists:false}});

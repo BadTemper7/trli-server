@@ -18,7 +18,7 @@ function dto(settings) {
     overtime:settings?.overtime || {start:'18:00',end:'08:00',fee:0,active:true},
     tax:settings?.tax || {vatRate:12,vatInclusive:false},
     shiftingFee:Number(settings?.shiftingFee||0),
-    storageBilling:settings?.storageBilling||{rounding:'CEIL_24_HOURS'},
+    storageBilling:settings?.storageBilling||{rounding:'CALENDAR_DAYS'},
     updatedAt: settings?.updatedAt || null,
   };
 }
@@ -57,7 +57,7 @@ export const updateCompanySettings = asyncHandler(async (req, res) => {
   if(tax && (!Number.isFinite(Number(tax.vatRate))||Number(tax.vatRate)<0||Number(tax.vatRate)>100||typeof tax.vatInclusive!=='boolean'))throw new AppError('Invalid VAT configuration.',400);
   if(req.body?.shiftingFee!==undefined&&(!Number.isFinite(Number(req.body.shiftingFee))||Number(req.body.shiftingFee)<0))throw new AppError('Invalid shifting fee.',400);
   const billing=req.body?.storageBilling;
-  if(billing&&billing.rounding!=='CEIL_24_HOURS')throw new AppError('Unsupported storage billing-day rule.',400);
+  if(billing&&!['CALENDAR_DAYS','CEIL_24_HOURS'].includes(billing.rounding))throw new AppError('Unsupported storage billing-day rule.',400);
   const settings = await SiteSettings.findOneAndUpdate(
     { key: SETTINGS_KEY },
     {
