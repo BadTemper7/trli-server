@@ -19,7 +19,9 @@
     "test": "node --test tests/*.test.js",
     "migrate:forwarding-indexes": "node scripts/setupForwardingIndexes.js",
     "migrate:storage-calendar": "node scripts/migrateStorageCalendarDays.js",
-    "migrate:universal-overtime": "node scripts/migrateUniversalOvertime.js"
+    "migrate:universal-overtime": "node scripts/migrateUniversalOvertime.js",
+    "audit:financial-refs": "node scripts/reconcileFinancialReferences.js",
+    "migrate:container-tracking": "node scripts/migrateContainerTracking.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",

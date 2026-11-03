@@ -1,230 +1,81 @@
 import PreAdvice from '../models/PreAdvice.js';
+import HistoricalContainer from '../models/HistoricalContainer.js';
 import StorageBlock from '../models/StorageBlock.js';
-import { asyncHandler } from '../utils/http.js';
+import {asyncHandler} from '../utils/http.js';
+import {reportRange,plusDays} from '../utils/businessRange.js';
+import {revenueSummary,revenueByClient,revenueTimeSeries} from '../services/revenueService.js';
 
-const startOfDay = (date = new Date()) => new Date(date.getFullYear(), date.getMonth(), date.getDate());
-const addDays = (date, days) => new Date(date.getTime() + days * 86400000);
-const startOfMonth = (date = new Date()) => new Date(date.getFullYear(), date.getMonth(), 1);
-const startOfPreviousMonth = (date = new Date()) => new Date(date.getFullYear(), date.getMonth() - 1, 1);
-const percentChange = (current, previous) => previous > 0 ? ((current - previous) / previous) * 100 : current > 0 ? 100 : 0;
-const moneyExpr = {
-  $add: [
-    { $cond: [{ $eq: ['$gateIn.payment.status', 'SUBMITTED'] }, { $ifNull: ['$gateIn.payment.amountSubmitted', 0] }, 0] },
-    { $cond: [{ $eq: ['$gateOut.payment.status', 'SUBMITTED'] }, { $ifNull: ['$gateOut.payment.amountSubmitted', 0] }, 0] },
-  ],
-};
-
-function parseRange(query = {}) {
-  const now = new Date();
-  const from = query.from ? new Date(`${query.from}T00:00:00`) : startOfMonth(now);
-  const to = query.to ? new Date(`${query.to}T23:59:59.999`) : now;
-  return {
-    from: Number.isNaN(from.getTime()) ? startOfMonth(now) : from,
-    to: Number.isNaN(to.getTime()) ? now : to,
-  };
+async function capacitySummary(){
+ const [blocks,live,legacy]=await Promise.all([
+  StorageBlock.aggregate([{$match:{status:{$in:['ACTIVE','FULL']}}},{$group:{_id:null,capacity:{$sum:'$capacityTeu'}}}]),
+  PreAdvice.aggregate([{$match:{'inventory.status':{$in:['IN_YARD','IN_STORAGE','RELEASE_PENDING']}}},{$group:{_id:null,count20:{$sum:{$cond:[{$eq:['$containerSize','20FT']},1,0]}},count40:{$sum:{$cond:[{$eq:['$containerSize','40FT']},1,0]}}}}]),
+  HistoricalContainer.aggregate([{$match:{deletedAt:null,status:{$in:['GATED_IN','STORED','GATE_OUT_APPROVED']}}},{$group:{_id:null,count20:{$sum:{$cond:[{$eq:['$containerSize','20FT']},1,0]}},count40:{$sum:{$cond:[{$eq:['$containerSize','40FT']},1,0]}}}}]),
+ ]);
+ const count20=(live[0]?.count20||0)+(legacy[0]?.count20||0),count40=(live[0]?.count40||0)+(legacy[0]?.count40||0);
+ const occupiedTeu=count20+count40*2,capacityTeu=blocks[0]?.capacity||0;
+ return {count20,count40,teu20:count20,teu40:count40*2,occupiedTeu,capacityTeu,availableTeu:Math.max(0,capacityTeu-occupiedTeu),occupancyRate:capacityTeu?100*occupiedTeu/capacityTeu:0};
 }
-
-async function revenueBetween(from, to) {
-  const rows = await PreAdvice.aggregate([
-    { $match: { $or: [
-      { 'gateIn.payment.submittedAt': { $gte: from, $lte: to } },
-      { 'gateOut.payment.submittedAt': { $gte: from, $lte: to } },
-    ] } },
-    { $project: {
-      value: {
-        $add: [
-          { $cond: [{ $and: [{ $eq: ['$gateIn.payment.status', 'SUBMITTED'] }, { $gte: ['$gateIn.payment.submittedAt', from] }, { $lte: ['$gateIn.payment.submittedAt', to] }] }, { $ifNull: ['$gateIn.payment.amountSubmitted', 0] }, 0] },
-          { $cond: [{ $and: [{ $eq: ['$gateOut.payment.status', 'SUBMITTED'] }, { $gte: ['$gateOut.payment.submittedAt', from] }, { $lte: ['$gateOut.payment.submittedAt', to] }] }, { $ifNull: ['$gateOut.payment.amountSubmitted', 0] }, 0] },
-        ],
-      },
-    } },
-    { $group: { _id: null, total: { $sum: '$value' } } },
-  ]);
-  return rows[0]?.total || 0;
+const dateFilter=(field,from,to)=>({[field]:{$gte:from,$lt:to}});
+const round=n=>Math.round(Number(n||0)*100)/100;
+function chartFormat(range){return range.mode==='daily'?'%H':range.mode==='yearly'||(range.to-range.from>36*86400000)?'%Y-%m':'%Y-%m-%d';}
+async function movementSeries(from,to,format){
+ return PreAdvice.aggregate([
+  {$project:{events:[{when:'$gateIn.actualGateInAt',type:'received'},{when:'$gateOut.releasedAt',type:'released'}]}},
+  {$unwind:'$events'},{$match:{'events.when':{$gte:from,$lt:to}}},
+  {$group:{_id:{label:{$dateToString:{format,date:'$events.when',timezone:'Asia/Manila'}},type:'$events.type'},count:{$sum:1}}},
+ ]);
 }
-
-async function capacitySummary() {
-  const [blocks, current] = await Promise.all([
-    StorageBlock.aggregate([{ $match: { status: { $in: ['ACTIVE', 'FULL'] } } }, { $group: { _id: null, capacity: { $sum: '$capacityTeu' } } }]),
-    PreAdvice.aggregate([
-      { $match: { 'inventory.status': { $in: ['IN_YARD', 'IN_STORAGE', 'RELEASE_PENDING'] } } },
-      { $group: {
-        _id: null,
-        count20: { $sum: { $cond: [{ $eq: ['$containerSize', '20FT'] }, 1, 0] } },
-        count40: { $sum: { $cond: [{ $eq: ['$containerSize', '40FT'] }, 1, 0] } },
-      } },
-    ]),
-  ]);
-  const count20 = current[0]?.count20 || 0;
-  const count40 = current[0]?.count40 || 0;
-  const occupiedTeu = count20 + count40 * 2;
-  const capacityTeu = blocks[0]?.capacity || 0;
-  return {
-    count20, count40,
-    teu20: count20,
-    teu40: count40 * 2,
-    occupiedTeu,
-    capacityTeu,
-    availableTeu: Math.max(0, capacityTeu - occupiedTeu),
-    occupancyRate: capacityTeu ? (occupiedTeu / capacityTeu) * 100 : 0,
-  };
-}
-
-export const dashboard = asyncHandler(async (req, res) => {
-  const now = new Date();
-  const today = startOfDay(now);
-  const tomorrow = addDays(today, 1);
-  const yesterday = addDays(today, -1);
-  const month = startOfMonth(now);
-  const prevMonth = startOfPreviousMonth(now);
-  const elapsedPreviousMonthEnd = new Date(prevMonth.getFullYear(), prevMonth.getMonth(), Math.min(now.getDate(), new Date(prevMonth.getFullYear(), prevMonth.getMonth() + 1, 0).getDate()), 23, 59, 59, 999);
-  const sevenDaysAgo = addDays(today, -6);
-  const thirtyDaysAgo = addDays(today, -29);
-  const overstayCutoff = addDays(now, -7);
-
-  const [receivedToday, receivedYesterday, releasedToday, releasedYesterday, inventoryCount, overstaying, capacity, revenueToday, revenueYesterday, revenueMTD, revenuePrevComparable] = await Promise.all([
-    PreAdvice.countDocuments({ 'gateIn.actualGateInAt': { $gte: today, $lt: tomorrow } }),
-    PreAdvice.countDocuments({ 'gateIn.actualGateInAt': { $gte: yesterday, $lt: today } }),
-    PreAdvice.countDocuments({ 'gateOut.releasedAt': { $gte: today, $lt: tomorrow } }),
-    PreAdvice.countDocuments({ 'gateOut.releasedAt': { $gte: yesterday, $lt: today } }),
-    PreAdvice.countDocuments({ 'inventory.status': { $in: ['IN_YARD', 'IN_STORAGE', 'RELEASE_PENDING'] } }),
-    PreAdvice.countDocuments({ 'storage.status': 'STORED', 'storage.storedAt': { $lte: overstayCutoff } }),
-    capacitySummary(),
-    revenueBetween(today, tomorrow),
-    revenueBetween(yesterday, today),
-    revenueBetween(month, now),
-    revenueBetween(prevMonth, elapsedPreviousMonthEnd),
-  ]);
-
-  const [movementRows, topClients, shippingLines, revenueRows] = await Promise.all([
-    PreAdvice.aggregate([
-      { $match: { $or: [{ 'gateIn.actualGateInAt': { $gte: sevenDaysAgo } }, { 'gateOut.releasedAt': { $gte: sevenDaysAgo } }] } },
-      { $project: { events: [
-        { date: '$gateIn.actualGateInAt', type: 'received' },
-        { date: '$gateOut.releasedAt', type: 'released' },
-      ] } },
-      { $unwind: '$events' },
-      { $match: { 'events.date': { $gte: sevenDaysAgo } } },
-      { $group: { _id: { day: { $dateToString: { format: '%Y-%m-%d', date: '$events.date' } }, type: '$events.type' }, count: { $sum: 1 } } },
-    ]),
-    PreAdvice.aggregate([
-      { $match: { $or: [{ 'gateIn.payment.status': 'SUBMITTED' }, { 'gateOut.payment.status': 'SUBMITTED' }] } },
-      { $lookup: { from: 'clientcompanies', localField: 'company', foreignField: '_id', as: 'companyDoc' } },
-      { $unwind: { path: '$companyDoc', preserveNullAndEmptyArrays: true } },
-      { $group: { _id: '$company', name: { $first: '$companyDoc.companyName' }, containers: { $sum: 1 }, revenue: { $sum: moneyExpr } } },
-      { $sort: { revenue: -1 } }, { $limit: 5 },
-    ]),
-    PreAdvice.aggregate([
-      { $match: { $or: [{ 'gateIn.actualGateInAt': { $gte: thirtyDaysAgo } }, { 'gateOut.releasedAt': { $gte: thirtyDaysAgo } }] } },
-      { $group: {
-        _id: '$shippingLine',
-        inbound: { $sum: { $cond: [{ $gte: ['$gateIn.actualGateInAt', thirtyDaysAgo] }, 1, 0] } },
-        outbound: { $sum: { $cond: [{ $gte: ['$gateOut.releasedAt', thirtyDaysAgo] }, 1, 0] } },
-      } },
-      { $project: { _id: 0, name: { $ifNull: ['$_id', 'Unknown'] }, inbound: 1, outbound: 1, total: { $add: ['$inbound', '$outbound'] } } },
-      { $sort: { total: -1 } }, { $limit: 5 },
-    ]),
-    PreAdvice.aggregate([
-      { $project: { payments: [
-        { date: '$gateIn.payment.submittedAt', amount: { $cond: [{ $eq: ['$gateIn.payment.status', 'SUBMITTED'] }, '$gateIn.payment.amountSubmitted', 0] } },
-        { date: '$gateOut.payment.submittedAt', amount: { $cond: [{ $eq: ['$gateOut.payment.status', 'SUBMITTED'] }, '$gateOut.payment.amountSubmitted', 0] } },
-      ] } },
-      { $unwind: '$payments' }, { $match: { 'payments.date': { $gte: sevenDaysAgo }, 'payments.amount': { $gt: 0 } } },
-      { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$payments.date' } }, revenue: { $sum: '$payments.amount' } } },
-      { $sort: { _id: 1 } },
-    ]),
-  ]);
-
-  const movementMap = new Map(movementRows.map((row) => [`${row._id.day}:${row._id.type}`, row.count]));
-  const revenueMap = new Map(revenueRows.map((row) => [row._id, row.revenue]));
-  const containerMovement = [];
-  const revenueTrend = [];
-  for (let i = 0; i < 7; i += 1) {
-    const date = addDays(sevenDaysAgo, i);
-    const key = date.toISOString().slice(0, 10);
-    const day = date.toLocaleDateString('en-PH', { month: 'short', day: 'numeric' });
-    containerMovement.push({ day, received: movementMap.get(`${key}:received`) || 0, released: movementMap.get(`${key}:released`) || 0 });
-    revenueTrend.push({ day, revenue: revenueMap.get(key) || 0 });
-  }
-
-  res.json({ success: true, data: {
-    meta: { dateLabel: now.toLocaleDateString('en-PH', { year: 'numeric', month: 'long', day: 'numeric' }), lastUpdated: now.toISOString() },
-    stats: {
-      receivedToday, receivedChange: percentChange(receivedToday, receivedYesterday),
-      releasedToday, releasedChange: percentChange(releasedToday, releasedYesterday),
-      currentInventory: inventoryCount,
-      totalCapacity: capacity.capacityTeu, availableCapacity: capacity.availableTeu, occupancyRate: capacity.occupancyRate,
-      revenueToday, revenueTodayChange: percentChange(revenueToday, revenueYesterday),
-      revenueMonthToDate: revenueMTD, revenueMonthChange: percentChange(revenueMTD, revenuePrevComparable),
-      overstayingContainers: overstaying, criticalOverstaying: overstaying,
-    },
-    revenueTrend,
-    containerMovement,
-    topCustomers: topClients.map((row) => ({ name: row.name || 'Unknown Client', containers: row.containers, revenue: row.revenue })),
-    shippingLineActivity: shippingLines,
-  } });
+export const dashboard=asyncHandler(async(req,res)=>{
+ const range=reportRange(req.query);
+ const {from,to}=range,span=to-from;
+ const previousFrom=new Date(from.getTime()-span);
+ const format=chartFormat(range);
+ const [received,released,prevReceived,prevReleased,currentLive,currentLegacy,pending,overstaying,capacity,revenue,revenuePrevious,trendRows,movementRows,topClients,shippingLines,totalLive,totalHistory]=await Promise.all([
+  PreAdvice.countDocuments(dateFilter('gateIn.actualGateInAt',from,to)),
+  PreAdvice.countDocuments(dateFilter('gateOut.releasedAt',from,to)),
+  PreAdvice.countDocuments(dateFilter('gateIn.actualGateInAt',previousFrom,from)),
+  PreAdvice.countDocuments(dateFilter('gateOut.releasedAt',previousFrom,from)),
+  PreAdvice.countDocuments({'inventory.status':{$in:['IN_YARD','IN_STORAGE','RELEASE_PENDING']}}),
+  HistoricalContainer.countDocuments({deletedAt:null,status:{$in:['GATED_IN','STORED','GATE_OUT_APPROVED']}}),
+  PreAdvice.countDocuments({...dateFilter('createdAt',from,to),'preAdviceReview.decision':'PENDING'}),
+  PreAdvice.countDocuments({'storage.status':'STORED','storage.storedAt':{$lt:new Date(Date.now()-7*86400000)}}),
+  capacitySummary(),revenueSummary(from,to),revenueSummary(previousFrom,from),
+  revenueTimeSeries(from,to,format),movementSeries(from,to,format),revenueByClient(from,to,5),
+  PreAdvice.aggregate([{$match:{$or:[dateFilter('gateIn.actualGateInAt',from,to),dateFilter('gateOut.releasedAt',from,to)]}},{$group:{_id:'$shippingLine',total:{$sum:1}}},{$sort:{total:-1}},{$limit:5}]),
+  PreAdvice.countDocuments(dateFilter('createdAt',from,to)),
+  HistoricalContainer.countDocuments({deletedAt:null,$or:[dateFilter('originTransactionDate',from,to),dateFilter('createdAt',from,to)]}),
+ ]);
+ const movementMap=new Map(movementRows.map(x=>[`${x._id.label}:${x._id.type}`,x.count]));
+ const revenueMap=new Map(trendRows.map(x=>[x._id,round(x.revenue)]));
+ const labels=[...new Set([...trendRows.map(x=>x._id),...movementRows.map(x=>x._id.label)])].sort();
+ const containerMovement=labels.map(day=>({day,received:movementMap.get(`${day}:received`)||0,released:movementMap.get(`${day}:released`)||0}));
+ const revenueTrend=labels.map(day=>({day,revenue:revenueMap.get(day)||0}));
+ const percent=(v,prev)=>prev?100*(v-prev)/prev:0;
+ res.json({success:true,data:{
+  meta:{dateLabel:range.label,lastUpdated:new Date().toISOString(),range:{period:range.mode,from:range.fromDay,to:range.toDay},timezone:'Asia/Manila'},
+  stats:{receivedToday:received,receivedChange:percent(received,prevReceived),releasedToday:released,releasedChange:percent(released,prevReleased),
+   currentInventory:currentLive+currentLegacy,totalContainers:totalLive+totalHistory,pendingApprovals:pending,overstayingContainers:overstaying,criticalOverstaying:overstaying,
+   ...capacity,revenueToday:revenue.total,totalRevenue:revenue.total,verifiedPayments:revenue.transactions,revenueTodayChange:percent(revenue.total,revenuePrevious.total),revenueMonthToDate:revenue.total,revenueMonthChange:percent(revenue.total,revenuePrevious.total)},
+  revenueTrend,containerMovement,topCustomers:topClients.map(x=>({name:x.client,containers:x.transactions,revenue:x.revenue})),
+  shippingLineActivity:shippingLines.map(x=>({name:x._id||'Unknown',total:x.total,inbound:x.total,outbound:0})),
+ }});
 });
-
-export const reports = asyncHandler(async (req, res) => {
-  const { from, to } = parseRange(req.query);
-  const releasePage = Math.max(1, Number.parseInt(req.query.page || '1', 10));
-  const releaseLimit = Math.min(50, Math.max(5, Number.parseInt(req.query.limit || '20', 10)));
-  const rangeMatch = { createdAt: { $gte: from, $lte: to }, status: { $ne: 'CANCELLED' } };
-  const releaseMatch = { 'gateOut.releasedAt': { $gte: from, $lte: to } };
-
-  const [breakdownRows, revenueClients, releaseRows, releaseTotal, releaseSummaryRows, capacity] = await Promise.all([
-    PreAdvice.aggregate([
-      { $match: rangeMatch },
-      { $group: { _id: null,
-        total: { $sum: 1 },
-        empty: { $sum: { $cond: [{ $eq: ['$loadStatus', 'EMPTY'] }, 1, 0] } },
-        loaded: { $sum: { $cond: [{ $eq: ['$loadStatus', 'LOADED'] }, 1, 0] } },
-        local: { $sum: { $cond: [{ $eq: ['$transactionClassification', 'LOCAL'] }, 1, 0] } },
-        international: { $sum: { $cond: [{ $eq: ['$transactionClassification', 'INTERNATIONAL'] }, 1, 0] } },
-        size20: { $sum: { $cond: [{ $eq: ['$containerSize', '20FT'] }, 1, 0] } },
-        size40: { $sum: { $cond: [{ $eq: ['$containerSize', '40FT'] }, 1, 0] } },
-      } },
-    ]),
-    PreAdvice.aggregate([
-      { $match: { $or: [
-        { 'gateIn.payment.submittedAt': { $gte: from, $lte: to }, 'gateIn.payment.status': 'SUBMITTED' },
-        { 'gateOut.payment.submittedAt': { $gte: from, $lte: to }, 'gateOut.payment.status': 'SUBMITTED' },
-      ] } },
-      { $lookup: { from: 'clientcompanies', localField: 'company', foreignField: '_id', as: 'companyDoc' } },
-      { $unwind: { path: '$companyDoc', preserveNullAndEmptyArrays: true } },
-      { $project: {
-        company: 1, name: '$companyDoc.companyName',
-        revenue: { $add: [
-          { $cond: [{ $and: [{ $eq: ['$gateIn.payment.status', 'SUBMITTED'] }, { $gte: ['$gateIn.payment.submittedAt', from] }, { $lte: ['$gateIn.payment.submittedAt', to] }] }, { $ifNull: ['$gateIn.payment.amountSubmitted', 0] }, 0] },
-          { $cond: [{ $and: [{ $eq: ['$gateOut.payment.status', 'SUBMITTED'] }, { $gte: ['$gateOut.payment.submittedAt', from] }, { $lte: ['$gateOut.payment.submittedAt', to] }] }, { $ifNull: ['$gateOut.payment.amountSubmitted', 0] }, 0] },
-        ] },
-      } },
-      { $group: { _id: '$company', name: { $first: '$name' }, revenue: { $sum: '$revenue' }, transactions: { $sum: { $cond: [{ $gt: ['$revenue', 0] }, 1, 0] } } } },
-      { $sort: { revenue: -1 } }, { $limit: 10 },
-    ]),
-    PreAdvice.find(releaseMatch).select('bookingReference containerNumber containerSize loadStatus transactionClassification shippingLine gateOut.releasedAt gateOut.releasedBy company').populate('company', 'companyName').sort({ 'gateOut.releasedAt': -1 }).skip((releasePage - 1) * releaseLimit).limit(releaseLimit).lean(),
-    PreAdvice.countDocuments(releaseMatch),
-    PreAdvice.aggregate([{ $match: releaseMatch }, { $group: { _id: null,
-      total: { $sum: 1 },
-      size20: { $sum: { $cond: [{ $eq: ['$containerSize', '20FT'] }, 1, 0] } },
-      size40: { $sum: { $cond: [{ $eq: ['$containerSize', '40FT'] }, 1, 0] } },
-      local: { $sum: { $cond: [{ $eq: ['$transactionClassification', 'LOCAL'] }, 1, 0] } },
-      international: { $sum: { $cond: [{ $eq: ['$transactionClassification', 'INTERNATIONAL'] }, 1, 0] } },
-    } }]),
-    capacitySummary(),
-  ]);
-
-  res.json({ success: true, data: {
-    range: { from: from.toISOString(), to: to.toISOString() },
-    containerBreakdown: breakdownRows[0] || { total: 0, empty: 0, loaded: 0, local: 0, international: 0, size20: 0, size40: 0 },
-    revenueByClient: revenueClients.map((row) => ({ client: row.name || 'Unknown Client', revenue: row.revenue, transactions: row.transactions })),
-    releaseSummary: releaseSummaryRows[0] || { total: 0, size20: 0, size40: 0, local: 0, international: 0 },
-    releasePagination: { page: releasePage, limit: releaseLimit, total: releaseTotal, totalPages: Math.max(1, Math.ceil(releaseTotal / releaseLimit)) },
-    releases: releaseRows.map((row) => ({
-      id: String(row._id), bookingReference: row.bookingReference, containerNumber: row.containerNumber, containerSize: row.containerSize,
-      loadStatus: row.loadStatus, classification: row.transactionClassification, shippingLine: row.shippingLine,
-      client: row.company?.companyName || 'Unknown Client', releasedAt: row.gateOut?.releasedAt, releasedBy: row.gateOut?.releasedBy || '',
-    })),
-    capacityEquivalent: capacity,
-  } });
+export const reports=asyncHandler(async(req,res)=>{
+ const range=reportRange(req.query,'monthly'),{from,to}=range;
+ const releasePage=Math.max(1,parseInt(req.query.page)||1),releaseLimit=Math.min(50,Math.max(5,parseInt(req.query.limit)||20));
+ const [breakdownRows,clients,releases,releaseTotal,releasesSummary,capacity,revenue,historyTotal]=await Promise.all([
+  PreAdvice.aggregate([{$match:dateFilter('createdAt',from,to)},{$group:{_id:null,total:{$sum:1},empty:{$sum:{$cond:[{$eq:['$loadStatus','EMPTY']},1,0]}},loaded:{$sum:{$cond:[{$eq:['$loadStatus','LOADED']},1,0]}},local:{$sum:{$cond:[{$eq:['$transactionClassification','LOCAL']},1,0]}},international:{$sum:{$cond:[{$eq:['$transactionClassification','INTERNATIONAL']},1,0]}},size20:{$sum:{$cond:[{$eq:['$containerSize','20FT']},1,0]}},size40:{$sum:{$cond:[{$eq:['$containerSize','40FT']},1,0]}}}}]),
+  revenueByClient(from,to,10),
+  PreAdvice.find(dateFilter('gateOut.releasedAt',from,to)).select('bookingReference containerNumber containerSize loadStatus transactionClassification shippingLine gateOut.releasedAt gateOut.releasedBy company').populate('company','companyName').sort({'gateOut.releasedAt':-1}).skip((releasePage-1)*releaseLimit).limit(releaseLimit).lean(),
+  PreAdvice.countDocuments(dateFilter('gateOut.releasedAt',from,to)),
+  PreAdvice.aggregate([{$match:dateFilter('gateOut.releasedAt',from,to)},{$group:{_id:null,total:{$sum:1},size20:{$sum:{$cond:[{$eq:['$containerSize','20FT']},1,0]}},size40:{$sum:{$cond:[{$eq:['$containerSize','40FT']},1,0]}},local:{$sum:{$cond:[{$eq:['$transactionClassification','LOCAL']},1,0]}},international:{$sum:{$cond:[{$eq:['$transactionClassification','INTERNATIONAL']},1,0]}}}}]),
+  capacitySummary(),revenueSummary(from,to),HistoricalContainer.countDocuments({deletedAt:null,$or:[dateFilter('originTransactionDate',from,to),dateFilter('createdAt',from,to)]}),
+ ]);
+ res.json({success:true,data:{range:{from:range.fromDay,to:range.toDay,period:range.mode,label:range.label,timezone:'Asia/Manila'},
+  totalRevenue:revenue.total,revenueTransactions:revenue.transactions,historicalContainerCount:historyTotal,
+  containerBreakdown:breakdownRows[0]||{total:0,empty:0,loaded:0,local:0,international:0,size20:0,size40:0},
+  revenueByClient:clients,releaseSummary:releasesSummary[0]||{total:0,size20:0,size40:0,local:0,international:0},
+  releasePagination:{page:releasePage,limit:releaseLimit,total:releaseTotal,totalPages:Math.max(1,Math.ceil(releaseTotal/releaseLimit))},
+  releases:releases.map(x=>({id:String(x._id),bookingReference:x.bookingReference,containerNumber:x.containerNumber,containerSize:x.containerSize,loadStatus:x.loadStatus,classification:x.transactionClassification,shippingLine:x.shippingLine,client:x.company?.companyName||'Unknown Client',releasedAt:x.gateOut?.releasedAt,releasedBy:x.gateOut?.releasedBy||''})),capacityEquivalent:capacity,
+ }});
 });

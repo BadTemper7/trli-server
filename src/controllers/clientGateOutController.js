@@ -112,7 +112,7 @@ export const reviewClientGateOut=asyncHandler(async(req,res)=>{
    bookingReference=booking.bookingReference;notifyBooking=booking;
    if(decision==='APPROVE'){
     if(Math.abs(payment.amount-invoice.balance)>0.001)throw new AppError('Submitted amount does not match the invoice.',409);
-    payment.status='VERIFIED';payment.verifiedAt=new Date();payment.verifiedBy=req.admin._id;payment.receiptNumber=await nextReference('RECEIPT',new Date(),session);await payment.save({session});
+    payment.status='VERIFIED';payment.verifiedAt=new Date();payment.verifiedBy=req.admin._id;payment.receiptNumber=await uniqueReceiptNumber(session);await payment.save({session});
     invoice.status='PAID';invoice.paidAmount=invoice.total;invoice.balance=0;invoice.paidAt=new Date();invoice.verifiedBy=req.admin._id;await invoice.save({session});
     booking.gateOut.approvalStatus='APPROVED';booking.gateOut.payment.status='VERIFIED';booking.gateOut.approvedAt=new Date();booking.gateOut.approvedBy=String(req.admin._id);booking.gateOut.readyForReleaseAt=new Date();booking.inventory.status='RELEASE_PENDING';
     advanceWorkflow(booking,['GATE_OUT_APPROVED','READY_FOR_RELEASE'],{note:'Payment verified and gate-out approved'});

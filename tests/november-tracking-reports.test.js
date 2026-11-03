@@ -1,0 +1,40 @@
+import test from 'node:test';import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import {manilaDay,reportRange,localMidnight} from '../src/utils/businessRange.js';
+import {canPrintGateIn,canPrintGateOut,canPrintHistorical} from '../src/utils/passAccess.js';
+import {validateHistoryChronology} from '../src/utils/containerTracking.js';
+const read=file=>fs.readFileSync(new URL(file,import.meta.url),'utf8');
+test('daily defaults to current Manila calendar day',()=>{const today=manilaDay(new Date());const r=reportRange({});assert.equal(r.fromDay,today);assert.equal(r.toDay,today);assert.equal((r.to-r.from)/86400000,1)});
+test('calendar weekly window is Monday to Sunday',()=>{const r=reportRange({period:'weekly'});const dow=new Date(`${r.fromDay}T12:00:00Z`).getUTCDay();assert.equal(dow,1);assert.equal((r.to-r.from)/86400000,7)});
+test('custom window includes end date and is exclusive at next Manila midnight',()=>{const r=reportRange({period:'custom',from:'2026-10-27',to:'2026-10-28'});assert.equal(r.from.toISOString(),'2026-10-26T16:00:00.000Z');assert.equal(r.to.toISOString(),'2026-10-28T16:00:00.000Z')});
+test('daily monthly yearly windows handle Manila midnight',()=>{for(const p of ['daily','monthly','yearly']){const r=reportRange({period:p});assert.equal(manilaDay(r.from),r.fromDay);assert.ok(r.to>r.from)}});
+test('invalid and reversed custom periods are rejected',()=>{assert.throws(()=>reportRange({period:'custom',from:'2026-12-01',to:'2026-11-01'}));assert.throws(()=>localMidnight('2026-02-30'))});
+test('Gate-in document blocked before physical confirmation',()=>{assert.equal(canPrintGateIn({gateIn:{inspection:{status:'ACCEPTED'}}}),false);assert.equal(canPrintGateIn({gateIn:{actualGateInAt:new Date(),inspection:{status:'ACCEPTED'}}}),true);assert.equal(canPrintGateIn({gateIn:{actualGateInAt:new Date(),inspection:{status:'REJECTED'}}}),false)});
+test('Gate-out document blocked before final approval',()=>{assert.equal(canPrintGateOut({gateOut:{requestedAt:new Date(),approvalStatus:'PENDING_APPROVAL'}}),false);assert.equal(canPrintGateOut({gateOut:{approvalStatus:'APPROVED',approvedAt:new Date()}}),true)});
+test('historical passes require individually attested approvals',()=>{assert.equal(canPrintHistorical({approvals:{gateIn:false}},'GATE_IN'),false);assert.equal(canPrintHistorical({approvals:{gateIn:true},gateIn:{actualGateInAt:new Date(),inspection:{status:'ACCEPTED'}}},'GATE_IN'),true);assert.equal(canPrintHistorical({approvals:{gateOut:true},deletedAt:new Date()},'GATE_OUT'),false)});
+test('historical records can be incomplete but must have chronological timestamps',()=>{assert.doesNotThrow(()=>validateHistoryChronology({status:'UNKNOWN',gateIn:{},gateOut:{}}));assert.throws(()=>validateHistoryChronology({status:'RELEASED',gateIn:{},gateOut:{}}));assert.throws(()=>validateHistoryChronology({status:'STORED',gateIn:{},gateOut:{}}));assert.throws(()=>validateHistoryChronology({status:'STORED',gateIn:{actualGateInAt:'2026-10-28T09:00:00+08:00'},storage:{storedAt:'2026-10-27T11:00:00+08:00'},gateOut:{}}))});
+test('payment review has an idempotent verified branch and a unique receipt allocator',()=>{const source=read('../src/controllers/invoiceController.js');assert.match(source,/alreadyReviewed=true/);assert.match(source,/uniqueReceiptNumber\(session\)/);assert.match(source,/if\(alreadyReviewed\)/)});
+test('revenue is computed only from verified payment events',()=>{const source=read('../src/services/revenueService.js');assert.match(source,/verifiedAt/);assert.match(source,/\$group:\{_id:'\$invoice'/);assert.doesNotMatch(source,/gateIn\.payment\.amountSubmitted/)});
+test('pass endpoints enforce authorization in both portals',()=>{const source=read('../src/routes/containerTrackingRoutes.js');assert.match(source,/adminAuth/);assert.match(source,/clientTracking.use\(auth\)/);assert.match(source,/requirePermission\(MODULES.CONTAINER_TRACKING/);const ctl=read('../src/controllers/containerTrackingController.js');assert.match(ctl,/req\.companyId=req\.user\.company\._id/);assert.match(ctl,/if\(!authorized\)throw new AppError/)});
+test('legacy records are isolated from paid bookings',()=>{const source=read('../src/models/HistoricalContainer.js');assert.match(source,/source:\{type:String,enum:\['HISTORICAL'\]/);const ctl=read('../src/controllers/containerTrackingController.js');assert.doesNotMatch(ctl,/Invoice\.create\(/)});
+test('archived tracking records are accessible only to admins and are read-only',()=>{
+  const source=read('../src/controllers/containerTrackingController.js');
+  assert.match(source,/!req\.companyId && truthy\(req\.query\.includeDeleted\)/);
+  assert.match(source,/req\.allowArchived=true/);
+  assert.match(source,/if\(!allowArchived\)filter\.deletedAt=null/);
+  assert.match(source,/req\.companyId=req\.user\.company\._id/);
+});
+test('import, correction and soft deletion commit with their audit records',()=>{
+  const source=read('../src/controllers/containerTrackingController.js');
+  assert.match(source,/HISTORICAL_CONTAINER_IMPORTED[\s\S]{0,190}session/);
+  assert.match(source,/HISTORICAL_CONTAINER_CORRECTED[\s\S]{0,170}session/);
+  assert.match(source,/CONTAINER_SOFT_DELETED[\s\S]{0,160}session/);
+});
+test('receipt uniqueness indexes are retained and reconciliation is dry-run by default',()=>{
+  const model=read('../src/models/PaymentSubmission.js');
+  const migration=read('../scripts/reconcileFinancialReferences.js');
+  assert.match(model,/name:'unique_issued_receipt'/);
+  assert.match(model,/unique:true/);
+  assert.match(migration,/if\(process\.argv\.includes\('--apply'\)\)/);
+  assert.doesNotMatch(migration,/dropIndex\(/);
+});

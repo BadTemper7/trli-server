@@ -118,6 +118,8 @@ const storageSchema = new mongoose.Schema({
 }, { _id: false });
 
 const schema = new mongoose.Schema({
+  deletedAt:{type:Date,default:null},
+  deletedBy:{type:mongoose.Schema.Types.ObjectId,ref:'AdminUser',default:null},
   bookingReference: { type: String, unique: true, index: true },
   company: { type: mongoose.Schema.Types.ObjectId, ref: 'ClientCompany', required: true, index: true },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'ClientUser', required: true },

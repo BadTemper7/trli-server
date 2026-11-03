@@ -4,6 +4,7 @@ import ClientCompany from '../models/ClientCompany.js';
 import SiteSettings from '../models/SiteSettings.js';
 import {renderGatePassPdf,renderServiceInvoicePdf} from '../services/printableDocuments.js';
 import {AppError,asyncHandler} from '../utils/http.js';
+import {canPrintGateIn,canPrintGateOut} from '../utils/passAccess.js';
 
 function download(res,buffer,filename) {
   return res.status(200).type('application/pdf')
@@ -21,22 +22,19 @@ async function bookingRecord(id) {
 
 export const downloadGateInPass=asyncHandler(async(req,res)=>{
   const booking=await bookingRecord(req.params.id);
-  if(!booking.preAdviceReview?.approvedAt && !['READY_FOR_GATE_IN','GATE_IN_PAYMENT_SUBMITTED','GATE_IN','INVENTORY','STORAGE','GATE_OUT_PAYMENT_SUBMITTED','READY_FOR_RELEASE','CONTAINER_RELEASED'].includes(booking.workflowStage)) {
-    throw new AppError('Approve Pre-advice before printing a Gate-in Pass.',409);
-  }
+  if(!canPrintGateIn(booking))throw new AppError('Gate-in pass is only available after accepted inspection and confirmed physical Gate-in.',403);
   download(res,renderGatePassPdf({booking,type:'GATE_IN'}),`${safeFile(booking.bookingReference)}-gate-in-pass.pdf`);
 });
 
 export const downloadGateOutPass=asyncHandler(async(req,res)=>{
   const booking=await bookingRecord(req.params.id);
-  if(!booking.gateOut?.requestedAt)throw new AppError('Gate-out request has not been submitted.',409);
-  // Draft passes are visibly labeled not valid for physical release.
+  if(!canPrintGateOut(booking))throw new AppError('Gate-out pass is only available after final Gate-out approval.',403);
   download(res,renderGatePassPdf({booking,type:'GATE_OUT'}),`${safeFile(booking.bookingReference)}-gate-out-${booking.gateOut?.approvedAt?'pass':'draft'}.pdf`);
 });
 
 export const downloadReleasePass=asyncHandler(async(req,res)=>{
   const booking=await bookingRecord(req.params.id);
-  if(!['APPROVED','RELEASED'].includes(booking.gateOut?.approvalStatus))throw new AppError('Gate-out approval is required before printing an authorized release pass.',409);
+  if(!canPrintGateOut(booking))throw new AppError('Gate-out approval is required before printing an authorized release pass.',409);
   download(res,renderGatePassPdf({booking,type:'GATE_OUT'}),`${safeFile(booking.bookingReference)}-authorized-gate-out-pass.pdf`);
 });
 

@@ -6,7 +6,7 @@ import PaymentSubmission from '../models/PaymentSubmission.js';
 import {getReceivingMethod,receivingAccountSnapshot} from '../services/paymentMethods.js';
 import PreAdvice from '../models/PreAdvice.js';
 import { buildInvoice } from '../services/invoicingService.js';
-import { nextReference } from '../utils/referenceNumbers.js';
+import { uniqueReceiptNumber } from '../utils/uniqueReceipt.js';
 import { AppError, asyncHandler } from '../utils/http.js';
 import { auditAdminAction } from '../services/adminAuditService.js';
 import { renderFinancialPdf } from '../services/pdfDocuments.js';
@@ -99,13 +99,17 @@ export const reviewPayment = asyncHandler(async (req,res) => {
   if(!['APPROVE','REJECT'].includes(decision))throw new AppError('Decision must be APPROVE or REJECT.',400);
   if(decision==='REJECT'&&!reason)throw new AppError('Rejection reason is required.',400);
   if(!mongoose.isValidObjectId(req.params.id))throw new AppError('Invalid payment identifier.',400);
-  const session=await mongoose.startSession();
-  let payment,invoice,booking;
-  try {
-    await session.withTransaction(async()=>{
+  let payment,invoice,booking,alreadyReviewed=false;
+  for(let attempt=0;attempt<4;attempt++) {
+    payment=null;invoice=null;booking=null;alreadyReviewed=false;
+    const session=await mongoose.startSession();
+    try {
+      await session.withTransaction(async()=>{
       payment=await PaymentSubmission.findOne({_id:req.params.id,status:'PENDING_VERIFICATION'}).session(session);
       if(!payment) {
-        const existing=await PaymentSubmission.findById(req.params.id).session(session).lean();
+        const existing=await PaymentSubmission.findById(req.params.id).session(session);
+        if(existing?.status==='VERIFIED' && decision==='APPROVE') { alreadyReviewed=true; payment=existing; invoice=await Invoice.findById(existing.invoice).session(session); booking=await PreAdvice.findById(existing.booking).session(session); return; }
+        if(existing?.status==='REJECTED' && decision==='REJECT') { alreadyReviewed=true; payment=existing; invoice=await Invoice.findById(existing.invoice).session(session); booking=await PreAdvice.findById(existing.booking).session(session); return; }
         throw new AppError(existing?.status==='VERIFIED'?'This payment has already been verified. Refresh the Gate-in drawer.':
           existing?.status==='REJECTED'?'This payment has already been rejected. Refresh the Gate-in drawer.':'Payment is not awaiting verification.',409);
       }
@@ -116,7 +120,7 @@ export const reviewPayment = asyncHandler(async (req,res) => {
       if(!booking.gateIn?.payment)throw new AppError('Booking does not have a Gate-in payment state. Contact technical support.',409);
       if(decision==='APPROVE') {
         if(!Number.isFinite(Number(payment.amount)) || Math.abs(Number(payment.amount)-Number(invoice.total))>0.001)throw new AppError('Payment amount does not match the invoice total.',409);
-        payment.receiptNumber=await nextReference('RECEIPT',new Date(),session);
+        payment.receiptNumber=await uniqueReceiptNumber(session);
         payment.status='VERIFIED';
         invoice.status='PAID';invoice.paidAmount=invoice.total;invoice.balance=0;invoice.paidAt=new Date();invoice.verifiedBy=req.admin._id;
         booking.gateIn.payment.status='VERIFIED';
@@ -131,14 +135,23 @@ export const reviewPayment = asyncHandler(async (req,res) => {
       await auditAdminAction({performedBy:req.admin._id,action:decision==='APPROVE'?'PAYMENT_VERIFIED':'PAYMENT_REJECTED',
         changes:{invoice:invoice.number,paymentId:String(payment._id),reference:payment.reference,reason},session});
     });
-  } catch (error) {
+      break;
+    } catch (error) {
+      const key=Object.keys(error?.keyPattern||error?.keyValue||{});
+      if(error?.code===11000 && attempt<3 && (key.includes('receiptNumber')||(key.includes('type')&&key.includes('day')))) {
+        console.warn('[RECEIPT_SEQUENCE_RETRY]',{paymentId:String(req.params.id),attempt:attempt+1,index:error?.index});
+        continue;
+      }
+    if(error?.code===11000)console.error('[PAYMENT_REVIEW_UNIQUE_CONFLICT]',{paymentId:String(req.params.id),index:error?.index,keyPattern:error?.keyPattern,code:error.code});
     const translated=paymentReviewFailure(error);
     if (translated===error && !error?.status) console.error('[GATE_IN_PAYMENT_REVIEW_FAILED]',{
       paymentId:String(req.params.id),errorName:error?.name,errorCode:error?.code,message:error?.message,
     });
     throw translated;
-  } finally { await session.endSession(); }
+    } finally { await session.endSession(); }
+  }
 
+  if(alreadyReviewed) return res.json({success:true,message:`Payment was already ${decision==='APPROVE'?'verified':'rejected'}. No duplicate financial transaction was created.`,data:{payment}});
   // Notifications must not change the result of a COMMITTED financial action.
   try {
     await enqueueBookingMail(booking,{

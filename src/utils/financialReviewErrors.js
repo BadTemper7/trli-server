@@ -3,7 +3,13 @@ import {AppError} from './http.js';
 /** Categorize expected payment review errors without exposing banking data. */
 export function paymentReviewFailure(error) {
   if (error instanceof AppError) return error;
-  if (error?.code === 11000) return new AppError('A duplicate receipt or financial reference was detected. Refresh the payment and retry.',409);
+  if (error?.code === 11000) {
+    const keys=Object.keys(error?.keyPattern||error?.keyValue||{});
+    if(keys.includes('receiptNumber'))return new AppError('Receipt number already exists. No payment was approved. Reconcile the receipt sequence before retrying.',409);
+    if(keys.includes('type')&&keys.includes('day'))return new AppError('Concurrent receipt numbering detected. Refresh and retry the payment verification.',409);
+    if(keys.includes('reference'))return new AppError('This payment reference is already assigned to another active or verified payment.',409);
+    return new AppError('A database uniqueness conflict prevented verification. Review the financial index details in the server log.',409);
+  }
   if (error?.hasErrorLabel?.('TransientTransactionError') || /WriteConflict|NoSuchTransaction/i.test(error?.message||'')) {
     return new AppError('Another transaction updated this payment. Refresh its status before trying again.',409);
   }
