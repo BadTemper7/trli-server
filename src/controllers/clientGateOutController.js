@@ -25,6 +25,7 @@ import {createNotification} from '../services/notificationService.js';
 import {validateUploadedProof,validatePaymentEvidence} from '../services/paymentProofValidation.js';
 import {emitToAdminModule,getIO} from '../socket/index.js';
 import {MODULES} from '../constants/permissions.js';
+import { clearSummaryCache } from '../utils/summaryCache.js';
 
 const stages=['GATE_OUT_REQUESTED','GATE_OUT_PAYMENT_SUBMITTED'];
 function validateGateOutAfterArrival(booking, day, hour) {
@@ -96,6 +97,7 @@ export const requestClientGateOut=asyncHandler(async(req,res)=>{
    committed=true;
   }finally{await session.endSession();}
   await createNotification({company:booking.company,audience:'ADMIN',type:'GATE_OUT_REQUESTED',title:'Gate-out request ready for review',message:`${booking.bookingReference} submitted a gate-out request and payment proof.`,data:{id:booking._id,bookingId:booking._id,bookingReference:booking.bookingReference}}).catch(console.error);
+  clearSummaryCache();
   emitToAdminModule(MODULES.GATE_OUT,'gate-out:updated',{id:String(booking._id),bookingReference:booking.bookingReference});
   emitToAdminModule(MODULES.PAYMENT_HISTORY,'invoice:updated',{bookingId:String(booking._id)});
   getIO()?.to(`company:${booking.company}`).emit('pre-advice:workflow-updated',{id:String(booking._id),workflowStage:'GATE_OUT_PAYMENT_SUBMITTED'});
@@ -192,6 +194,7 @@ export const reviewClientGateOut=asyncHandler(async(req,res)=>{
    invoiceNumber:invoice.number,amount:payment.amount});
  }catch(error){console.error('[GATE_OUT_NOTIFICATION_RETRY_NEEDED]',{paymentId:String(payment._id),message:error?.message});}
  try{
+  clearSummaryCache();
   emitToAdminModule(MODULES.GATE_OUT,decision==='APPROVE'?'gate-out:approved':'gate-out:updated',{id:String(booking._id),bookingReference:booking.bookingReference});
   if(decision==='APPROVE')emitToAdminModule(MODULES.RELEASE_CONTAINER,'release:queue-updated',{id:String(booking._id),bookingReference:booking.bookingReference});
   emitToAdminModule(MODULES.PAYMENT_HISTORY,'invoice:updated',{bookingId:String(booking._id)});

@@ -8,4 +8,7 @@ const schema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now, index: true },
 });
 
+schema.index({createdAt:-1,_id:-1},{name:'idx_audit_cursor'});
+schema.index({action:1,createdAt:-1,_id:-1},{name:'idx_audit_action_cursor'});
+
 export default mongoose.model('AdminAuditLog', schema);

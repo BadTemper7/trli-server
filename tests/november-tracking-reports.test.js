@@ -19,7 +19,9 @@ test('pass endpoints enforce authorization in both portals',()=>{const source=re
 test('legacy records are isolated from paid bookings',()=>{const source=read('../src/models/HistoricalContainer.js');assert.match(source,/source:\{type:String,enum:\['HISTORICAL'\]/);const ctl=read('../src/controllers/containerTrackingController.js');assert.doesNotMatch(ctl,/Invoice\.create\(/)});
 test('archived tracking records are accessible only to admins and are read-only',()=>{
   const source=read('../src/controllers/containerTrackingController.js');
-  assert.match(source,/!req\.companyId && truthy\(req\.query\.includeDeleted\)/);
+  assert.match(source,/buildContainerFilters\(req\.query,\{company:req\.companyId\|\|null,isAdmin:!req\.companyId\}\)/);
+  const filterBuilder=read('../src/services/tableFilters.js');
+  assert.match(filterBuilder,/isAdmin && !global && booleanParam\(query, 'includeDeleted'\)/);
   assert.match(source,/req\.allowArchived=true/);
   assert.match(source,/if\(!allowArchived\)filter\.deletedAt=null/);
   assert.match(source,/req\.companyId=req\.user\.company\._id/);

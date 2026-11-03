@@ -21,4 +21,8 @@ const schema=new mongoose.Schema({
   history:[auditEntry],createdBy:{type:mongoose.Schema.Types.ObjectId,ref:'AdminUser'},updatedBy:{type:mongoose.Schema.Types.ObjectId,ref:'AdminUser'},
 },{timestamps:true});
 schema.index({containerNumber:1},{unique:true,partialFilterExpression:{deletedAt:null,status:{$in:['GATED_IN','STORED','GATE_OUT_APPROVED']}},name:'unique_active_imported_container'});
+schema.index({deletedAt:1,company:1,createdAt:-1,_id:-1},{name:'idx_historical_company_created'});
+schema.index({deletedAt:1,status:1,createdAt:-1,_id:-1},{name:'idx_historical_status_created'});
+schema.index({deletedAt:1,createdAt:-1,_id:-1},{name:'idx_historical_created'});
+
 export default mongoose.model('HistoricalContainer',schema);

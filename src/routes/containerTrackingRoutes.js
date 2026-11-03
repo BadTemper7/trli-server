@@ -4,9 +4,10 @@ import {adminAuth,requirePasswordChanged} from '../middleware/adminAuth.js';
 import {auth} from '../middleware/auth.js';
 import {requirePermission} from '../middleware/requirePermission.js';
 import {MODULES,ACTIONS} from '../constants/permissions.js';
-import {adminContainers,clientContainers,adminDetail,clientDetail,addHistorical,editContainer,deleteContainer,printPass,clientPass,companies} from '../controllers/containerTrackingController.js';
+import {adminContainers,clientContainers,containersSummary,adminDetail,clientDetail,addHistorical,editContainer,deleteContainer,printPass,clientPass,companies} from '../controllers/containerTrackingController.js';
 export const adminTracking=Router();adminTracking.use(adminAuth,requirePasswordChanged);
 adminTracking.get('/',requirePermission(MODULES.CONTAINER_TRACKING,ACTIONS.VIEW),adminContainers);
+adminTracking.get('/summary',requirePermission(MODULES.CONTAINER_TRACKING,ACTIONS.VIEW),containersSummary);
 adminTracking.get('/companies',requirePermission(MODULES.CONTAINER_TRACKING,ACTIONS.VIEW),companies);
 adminTracking.post('/historical',requirePermission(MODULES.CONTAINER_TRACKING,ACTIONS.CREATE),addHistorical);
 adminTracking.get('/:source/:id',requirePermission(MODULES.CONTAINER_TRACKING,ACTIONS.VIEW),adminDetail);
@@ -15,5 +16,6 @@ adminTracking.delete('/:source/:id',requirePermission(MODULES.CONTAINER_TRACKING
 adminTracking.get('/:source/:id/pass/:type',requirePermission(MODULES.CONTAINER_TRACKING,ACTIONS.VIEW),printPass);
 export const clientTracking=Router();clientTracking.use(auth);
 clientTracking.get('/',clientContainers);
+clientTracking.get('/summary',(req,res,next)=>{req.companyId=req.user.company._id;return containersSummary(req,res,next);});
 clientTracking.get('/:source/:id',clientDetail);
 clientTracking.get('/:source/:id/pass/:type',clientPass);

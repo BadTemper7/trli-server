@@ -17,4 +17,9 @@ const schema = new mongoose.Schema({
 schema.index({ audience: 1, module: 1, createdAt: -1 });
 schema.index({ audience: 1, modules: 1, createdAt: -1 });
 schema.index({ audience: 1, createdAt: -1 });
+schema.index({audience:1,module:1,createdAt:-1,_id:-1},{name:'idx_notification_module_cursor'});
+schema.index({audience:1,modules:1,createdAt:-1,_id:-1},{name:'idx_notification_modules_cursor'});
+schema.index({user:1,createdAt:-1,_id:-1},{name:'idx_notification_user_cursor'});
+schema.index({audience:1,company:1,createdAt:-1,_id:-1},{name:'idx_notification_company_cursor'});
+
 export default mongoose.model('Notification', schema);

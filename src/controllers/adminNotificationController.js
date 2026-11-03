@@ -2,6 +2,7 @@ import Notification from '../models/Notification.js';
 import { adminNotificationFilter } from '../services/notificationRouting.js';
 import { getIO } from '../socket/index.js';
 import { asyncHandler, ok, AppError } from '../utils/http.js';
+import { listDocuments } from '../utils/tableQuery.js';
 
 const toPublic = (item, userId) => ({
   _id: String(item._id),
@@ -11,17 +12,15 @@ const toPublic = (item, userId) => ({
 });
 
 export const listAdminNotifications = asyncHandler(async (req, res) => {
-  const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
-  const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 30));
-  const query = adminNotificationFilter(req.admin);
-  const [items, total, unread] = await Promise.all([
-    Notification.find(query).sort({ createdAt: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).lean(),
-    Notification.countDocuments(query),
-    Notification.countDocuments({ $and: [query, { adminReadBy: { $ne: req.admin._id } }] }),
+  const filter = adminNotificationFilter(req.admin);
+  const [{ items, pagination }, unread] = await Promise.all([
+    listDocuments(Notification, filter, req.query, { defaultLimit: 30, maxLimit: 100,
+      sorts: ['createdAt', '_id'], select: 'type title message module data adminReadBy createdAt' }),
+    Notification.countDocuments({ $and: [filter, { adminReadBy: { $ne: req.admin._id } }] }),
   ]);
   res.set('Cache-Control', 'private, no-store');
   ok(res, { items: items.map(item => toPublic(item, req.admin._id)), unread,
-    pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) } });
+    pagination: { ...pagination, totalPages: pagination.totalPages ?? null } });
 });
 
 export const readAdminNotification = asyncHandler(async (req, res) => {

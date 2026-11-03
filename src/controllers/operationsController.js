@@ -17,6 +17,10 @@ import {enqueueBookingMail} from '../services/transactionalMail.js';
 import mongoose from 'mongoose';
 import { parseGateInInspection } from '../utils/gateInInspection.js';
 import { storageDaysBetween } from '../utils/storageDuration.js';
+import { buildOperationFilter } from '../services/tableFilters.js';
+import { getOperationSummary } from '../services/tableSummaries.js';
+import { listDocuments } from '../utils/tableQuery.js';
+import { clearSummaryCache } from '../utils/summaryCache.js';
 
 const adminId = (req) => String(req.admin?._id || req.admin?.id || 'admin');
 
@@ -170,6 +174,7 @@ function itemDto(item, extras = {}) {
 }
 
 async function notifyWorkflow(item, module, event, title, message) {
+  clearSummaryCache();
   const payload = itemDto(item);
   emitToAdminModule(module, event, payload);
   getIO()?.to(`company:${item.company?._id || item.company}`).emit('pre-advice:workflow-updated', {
@@ -205,42 +210,22 @@ async function findItem(id) {
   return item;
 }
 
-function buildFilter(query = {}, stages = null) {
-  const filter = {};
-  if (stages?.length) filter.workflowStage = { $in: stages };
-  if (query.stage) filter.workflowStage = String(query.stage).toUpperCase();
-  if (query.status) filter.status = String(query.status).toUpperCase();
-  if (query.search) {
-    const rx = { $regex: escapeRx(query.search), $options: 'i' };
-    filter.$or = [{ bookingReference: rx }, { containerNumber: rx }, { shippingLine: rx }];
-  }
-  return filter;
-}
-
 const LIST_FIELDS = 'bookingReference company containerNumber containerSize containerType loadStatus transactionClassification shippingLine scheduledGateDateIn scheduledGateTimeIn truckPlateNumber driverName driverLicenceNumber hauler weight status workflowStage preAdviceReview gateIn inventory storage gateOut createdAt updatedAt';
-
+const OPERATION_LIST_SORTS = ['updatedAt', 'createdAt', 'bookingReference', 'containerNumber', 'status', 'workflowStage'];
 async function listItems(filter, query = {}) {
-  const page = Math.max(1, Number.parseInt(query.page, 10) || 1);
-  const limit = Math.min(100, Math.max(5, Number.parseInt(query.limit, 10) || 20));
-  const [rows, total] = await Promise.all([
-    PreAdvice.find(filter)
-      .select(LIST_FIELDS)
-      .populate('company', 'companyName verificationStatus')
-      .populate('storage.block', 'name')
-      .sort({ updatedAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit),
-    PreAdvice.countDocuments(filter),
-  ]);
-  return { rows, pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) } };
+  const { items, pagination } = await listDocuments(PreAdvice, filter, query, {
+    defaultLimit: 20, maxLimit: 100, sorts: OPERATION_LIST_SORTS, defaultSort: 'updatedAt',
+    select: LIST_FIELDS,
+    populate: [{ path: 'company', select: 'companyName verificationStatus' }, { path: 'storage.block', select: 'name' }],
+  });
+  return { rows: items, pagination };
 }
-
+export const operationSummary = asyncHandler(async (req, res) => {
+  const { scope, summary } = await getOperationSummary(req.query, req.params.resource);
+  res.json({ success: true, data: { ...summary, scope, summary } });
+});
 export const listAdminPreAdvice = asyncHandler(async (req, res) => {
-  const filter=buildFilter(req.query);
-  filter.$and=[{status:{$in:['SUBMITTED','READY_FOR_GATE_IN','REJECTED']}},{$or:[{workflowStage:'BOOKING_SUBMITTED'},{workflowStage:'READY_FOR_GATE_IN'}]}];
-  if(req.query.approval==='PENDING')filter.$and.push({status:'SUBMITTED',workflowStage:'BOOKING_SUBMITTED'});
-  if(req.query.approval==='APPROVED')filter.$and.push({status:'READY_FOR_GATE_IN'});
-  if(req.query.approval==='REJECTED')filter.$and.push({status:'REJECTED'});
+  const filter = buildOperationFilter(req.query, 'pre-advice');
   const { rows, pagination } = await listItems(filter, req.query);
   res.json({ success: true, message: 'Pre-advice records loaded.', data: { items: rows.map((row) => itemDto(row)), pagination } });
 });
@@ -313,13 +298,22 @@ export const rejectPreAdvice = asyncHandler(async (req, res) => {
 });
 
 export const listGateIn = asyncHandler(async (req, res) => {
-  const stages = ['READY_FOR_GATE_IN', 'GATE_IN_PAYMENT_SUBMITTED'];
-  const { rows, pagination } = await listItems(buildFilter(req.query, stages), req.query);
+  const { rows, pagination } = await listItems(buildOperationFilter(req.query, 'gate-in'), req.query);
+  // Fetch invoice snapshots for the visible page in ONE indexed query.
+  // Per-row findOne() turned a 20-row table into 21 database round-trips.
   const Invoice=(await import('../models/Invoice.js')).default;
-  const items=await Promise.all(rows.map(async row=>{
-    const invoice=await Invoice.findOne({booking:row._id,type:'GATE_IN'}).lean();
-    return itemDto(row,{gateInCharges:{invoiceId:invoice?._id?String(invoice._id):null,total:invoice?.total??0,charges:invoice?.lines||[],invoiceNumber:invoice?.number,paymentStatus:invoice?.status}});
-  }));
+  const invoices = rows.length ? await Invoice.find({
+    booking: { $in: rows.map(row => row._id) }, type: 'GATE_IN',
+  }).select('booking number total lines status').lean() : [];
+  const byBooking = new Map(invoices.map(invoice => [String(invoice.booking), invoice]));
+  const items = rows.map(row => {
+    const invoice = byBooking.get(String(row._id));
+    return itemDto(row, { gateInCharges: {
+      invoiceId: invoice?._id ? String(invoice._id) : null,
+      total: invoice?.total ?? 0, charges: invoice?.lines || [],
+      invoiceNumber: invoice?.number, paymentStatus: invoice?.status,
+    } });
+  });
   res.json({ success: true, message: 'Gate-in queue loaded.', data: { items, pagination } });
 });
 
@@ -488,9 +482,7 @@ export const processGateIn = asyncHandler(async (req,res) => {
 });
 
 export const listInventory = asyncHandler(async (req, res) => {
-  const filter = buildFilter(req.query);
-  filter.status = { $in: ['GATED_IN', 'COMPLETED'] };
-  if (!req.query.includeReleased) filter.workflowStage = { $ne: 'CONTAINER_RELEASED' };
+  const filter = buildOperationFilter(req.query, 'inventory');
   const { rows, pagination } = await listItems(filter, req.query);
   res.json({ success: true, message: 'Inventory loaded.', data: { items: rows.map((row) => itemDto(row)), pagination } });
 });
@@ -513,10 +505,21 @@ export const updateInventory = asyncHandler(async (req, res) => {
 });
 
 export const listGateOut = asyncHandler(async (req, res) => {
-  const stages = ['GATE_OUT_PAYMENT_SUBMITTED'];
-  const { rows, pagination } = await listItems(buildFilter(req.query, stages), req.query);
-  const items = await Promise.all(rows.map(async (row) => {
-    const payment = await paymentSummary(row, 'GATE_OUT');
+  const { rows, pagination } = await listItems(buildOperationFilter(req.query, 'gate-out'), req.query);
+  // The paid/submitted queue has an invoice for almost every row. Use the
+  // compound (booking,type) index once per page; preserve legacy rate fallback.
+  const Invoice = (await import('../models/Invoice.js')).default;
+  const invoices = rows.length ? await Invoice.find({
+    booking: { $in: rows.map(row => row._id) }, type: 'GATE_OUT',
+  }).select('booking number status lines total subtotal vat').lean() : [];
+  const byBooking = new Map(invoices.map(invoice => [String(invoice.booking), invoice]));
+  const items = await Promise.all(rows.map(async row => {
+    const invoice = byBooking.get(String(row._id));
+    const payment = invoice ? {
+      invoiceId: String(invoice._id), invoiceNumber: invoice.number,
+      paymentStatus: invoice.status, charges: invoice.lines || [], total: invoice.total,
+      subtotal: invoice.subtotal, vat: invoice.vat,
+    } : await paymentSummary(row, 'GATE_OUT');
     return itemDto(row, { gateOutCharges: payment });
   }));
   res.json({ success: true, message: 'Gate-out queue loaded.', data: { items, pagination } });
@@ -592,7 +595,7 @@ export const approveGateOut = asyncHandler(async (req, res) => {
 });
 
 export const listRelease = asyncHandler(async (req, res) => {
-  const { rows, pagination } = await listItems(buildFilter(req.query, ['READY_FOR_RELEASE']), req.query);
+  const { rows, pagination } = await listItems(buildOperationFilter(req.query, 'release'), req.query);
   res.json({ success: true, message: 'Release queue loaded.', data: { items: rows.map((row) => itemDto(row)), pagination } });
 });
 

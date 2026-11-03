@@ -2,6 +2,10 @@ import PreAdvice from '../models/PreAdvice.js';
 import Invoice from '../models/Invoice.js';
 import Rate from '../models/Rate.js';
 import { availableBookingLoadStatuses } from '../utils/bookingRateOptions.js';
+import { buildBookingFilter } from '../services/tableFilters.js';
+import { getBookingSummary } from '../services/tableSummaries.js';
+import { listDocuments } from '../utils/tableQuery.js';
+import { clearSummaryCache } from '../utils/summaryCache.js';
 import mongoose from 'mongoose';
 import { getIO, emitToAdminModule } from '../socket/index.js';
 import { MODULES } from '../constants/permissions.js';
@@ -76,51 +80,27 @@ async function requireAvailableReeferLoadStatus(data, existing = null) {
 export const availability = asyncHandler(async(req,res)=>{if(!/^\d{4}-\d{2}-\d{2}$/.test(String(req.query.day||'')))throw new AppError('A valid date is required.',400); ok(res,{slots:await slotAvailability(req.query.day)});});
 
 export const list = asyncHandler(async (req, res) => {
-  const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
-  const limit = Math.min(50, Math.max(5, Number.parseInt(req.query.limit, 10) || 10));
-  const filter = { company: req.user.company._id };
-  const status = String(req.query.status || '').trim().toUpperCase();
-  if (['DRAFT', 'SUBMITTED', 'REJECTED', 'SCHEDULED', 'READY_FOR_GATE_IN', 'GATED_IN', 'COMPLETED', 'CANCELLED'].includes(status)) filter.status = status;
-  const category=String(req.query.category||'ALL').toUpperCase();
-  if(!['ALL','GATE_IN_PAYMENT','REQUESTABLE_GATE_OUT','GATE_OUT_PAYMENT'].includes(category))throw new AppError('Invalid booking filter.',400);
-  if(category==='GATE_IN_PAYMENT'||category==='GATE_OUT_PAYMENT'){
-    filter._id={$in:await Invoice.distinct('booking',{company:req.user.company._id,type:category==='GATE_IN_PAYMENT'?'GATE_IN':'GATE_OUT'})};
-  }else if(category==='REQUESTABLE_GATE_OUT'){
-    Object.assign(filter,{workflowStage:'STORAGE','storage.status':'STORED','gateOut.approvedAt':null,'gateOut.releasedAt':null,'gateOut.payment.status':{$nin:['SUBMITTED','VERIFIED']}});
-  }
-  const search = String(req.query.search || '').trim();
-  if (search) {
-    const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const rx = { $regex: escaped, $options: 'i' };
-    filter.$or = [{ bookingReference: rx }, { containerNumber: rx }, { shippingLine: rx }];
-  }
-
-  const [items, total, summaryRows] = await Promise.all([
-    PreAdvice.find(filter)
-      .select('bookingReference containerNumber containerSize containerType scheduledGateDateIn scheduledGateTimeIn shippingLine status workflowStage cancellation createdAt updatedAt gateIn.actualGateInAt gateIn.inspection gateIn.payment storage gateOut truckPlateNumber driverName driverLicenceNumber hauler loadStatus')
-      .populate('storage.block','name')
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .lean(),
-    PreAdvice.countDocuments(filter),
-    PreAdvice.aggregate([
-      { $match: { company: req.user.company._id } },
-      { $group: { _id: null,
-        all: { $sum: 1 },
-        pending: { $sum: { $cond: [{ $in: ['$status', ['DRAFT', 'SUBMITTED']] }, 1, 0] } },
-        yard: { $sum: { $cond: [{ $or: [{ $in: ['$status', ['READY_FOR_GATE_IN', 'GATED_IN']] }, { $in: ['$workflowStage', ['GATE_IN_PAYMENT_SUBMITTED', 'GATE_IN', 'INVENTORY', 'STORAGE']] }] }, 1, 0] } },
-        complete: { $sum: { $cond: [{ $or: [{ $eq: ['$status', 'COMPLETED'] }, { $eq: ['$workflowStage', 'CONTAINER_RELEASED'] }] }, 1, 0] } },
-      } },
-    ]),
-  ]);
-  const summary = summaryRows[0] || { all: 0, pending: 0, yard: 0, complete: 0 };
-  ok(res, {
-    bookings: items.map(item=>({...item,id:String(item._id)})),
-    items,
-    summary: { all: summary.all || 0, pending: summary.pending || 0, yard: summary.yard || 0, complete: summary.complete || 0 },
-    pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+  const filter = await buildBookingFilter(req.query, req.user.company._id);
+  const { items, pagination } = await listDocuments(PreAdvice, filter, req.query, {
+    defaultLimit: 20, maxLimit: 100,
+    sorts: ['createdAt', 'updatedAt', 'bookingReference', 'containerNumber', 'status'],
+    select: 'bookingReference company containerNumber containerSize containerType scheduledGateDateIn scheduledGateTimeIn shippingLine status workflowStage cancellation createdAt updatedAt gateIn.actualGateInAt gateIn.inspection gateIn.payment storage gateOut truckPlateNumber driverName driverLicenceNumber hauler loadStatus',
+    populate: { path: 'storage.block', select: 'name' },
   });
+  // Compatibility: old portal integrations read data.summary and data.bookings.
+  // A cached full-collection aggregation, never the paginated items, drives it.
+  const { summary } = await getBookingSummary({}, req.user.company._id, 'global');
+  const bookings = items.map(item => ({ ...item, id: String(item._id) }));
+  res.json({ success: true, message: 'Bookings loaded.',
+    items, total: pagination.total ?? null, page: pagination.page, limit: pagination.limit,
+    pages: pagination.pages ?? null, nextCursor: pagination.nextCursor ?? null,
+    hasMore: pagination.hasMore ?? (pagination.page < pagination.totalPages),
+    data: { items, bookings, summary, pagination } });
+});
+
+export const summary = asyncHandler(async (req, res) => {
+  const { scope, summary: cards } = await getBookingSummary(req.query, req.user.company._id);
+  ok(res, { ...cards, scope, summary: cards });
 });
 
 export const detail = asyncHandler(async (req, res) => {
@@ -153,6 +133,7 @@ export const create = asyncHandler(async (req, res) => {
     await item.save({session});
   });}finally{await session.endSession();}
 
+  clearSummaryCache();
   emitToAdminModule(MODULES.PRE_ADVICE, 'pre-advice:new', {
     id: String(item._id),
     bookingReference: item.bookingReference,
@@ -212,6 +193,7 @@ export const update = asyncHandler(async (req, res) => {
 
 
   const updated = await PreAdvice.findById(item._id);
+  clearSummaryCache();
   getIO()?.to(`company:${item.company}`).emit('pre-advice:updated', updated);
   emitToAdminModule(MODULES.PRE_ADVICE, 'pre-advice:updated', updated);
 
@@ -253,6 +235,7 @@ export const cancel = asyncHandler(async (req, res) => {
     cancellation: item.cancellation,
     updatedAt: item.updatedAt,
   };
+  clearSummaryCache();
   getIO()?.to(`company:${item.company}`).emit('pre-advice:status-updated', payload);
   emitToAdminModule(MODULES.PRE_ADVICE, 'pre-advice:cancelled', payload);
   await createNotification({

@@ -2,6 +2,10 @@ import fs from 'fs/promises';
 import path from 'path';
 import mongoose from 'mongoose';
 import Invoice from '../models/Invoice.js';
+import { buildInvoiceFilter } from '../services/tableFilters.js';
+import { getInvoiceSummary } from '../services/tableSummaries.js';
+import { listDocuments } from '../utils/tableQuery.js';
+import { clearSummaryCache } from '../utils/summaryCache.js';
 import PaymentSubmission from '../models/PaymentSubmission.js';
 import {getReceivingMethod,receivingAccountSnapshot} from '../services/paymentMethods.js';
 import PreAdvice from '../models/PreAdvice.js';
@@ -23,16 +27,28 @@ import { createNotification } from '../services/notificationService.js';
 const owner = (req) => req.user.company._id;
 const filterFor = (req) => req.user ? { company: owner(req) } : {};
 
-export const listClientInvoices = asyncHandler(async (req, res) => {
-  const items = await Invoice.find({ company: owner(req) }).sort({createdAt:-1}).limit(300).lean();
-  res.json({success:true,data:{items}});
+const INVOICE_LIST_FIELDS = 'number booking company type status subtotal vat total paidAmount balance vatRate vatInclusive vatableSales nonVatableSales createdAt updatedAt';
+const INVOICE_LIST_SORTS = ['createdAt', 'updatedAt', 'number', 'status', 'total'];
+async function sendInvoiceList(req, res, company = null) {
+  const filter = buildInvoiceFilter(req.query, { company });
+  const { items, pagination } = await listDocuments(Invoice, filter, req.query, {
+    defaultLimit: 20, maxLimit: 100, sorts: INVOICE_LIST_SORTS, select: INVOICE_LIST_FIELDS,
+    ...(company ? {} : { populate: { path: 'company', select: 'companyName' } }),
+  });
+  res.json({ success: true, items, total: pagination.total ?? null, page: pagination.page,
+    limit: pagination.limit, pages: pagination.pages ?? null, nextCursor: pagination.nextCursor ?? null,
+    hasMore: pagination.hasMore ?? (pagination.page < pagination.totalPages),
+    data: { items, pagination } });
+}
+export const listClientInvoices = asyncHandler(async (req, res) => sendInvoiceList(req, res, owner(req)));
+export const listAdminInvoices = asyncHandler(async (req, res) => sendInvoiceList(req, res));
+export const clientInvoiceSummary = asyncHandler(async (req, res) => {
+  const { scope, summary } = await getInvoiceSummary(req.query, owner(req));
+  res.json({ success: true, data: { ...summary, scope, summary } });
 });
-export const listAdminInvoices = asyncHandler(async (req, res) => {
-  const filter={};
-  for(const name of ['status','type','company']) if(req.query[name])filter[name]=req.query[name];
-  if(req.query.booking && mongoose.isValidObjectId(req.query.booking))filter.booking=req.query.booking;
-  const items=await Invoice.find(filter).populate('company','companyName').sort({createdAt:-1}).limit(300).lean();
-  res.json({success:true,data:{items}});
+export const adminInvoiceSummary = asyncHandler(async (req, res) => {
+  const { scope, summary } = await getInvoiceSummary(req.query);
+  res.json({ success: true, data: { ...summary, scope, summary } });
 });
 export const getClientInvoice = asyncHandler(async (req, res) => {
   const invoice=await Invoice.findOne({_id:req.params.id,company:owner(req)}).lean();
@@ -100,6 +116,7 @@ export const submitProof = asyncHandler(async (req,res) => {
         message: `Payment proof was submitted for ${bookingReference || invoice.number}.`,
         data: { id: invoice.booking, bookingId: invoice.booking, bookingReference, invoiceId: invoice._id, paymentId: payment._id },
       });
+      clearSummaryCache();
       emitToAdminModule(MODULES.GATE_IN, 'gate-in:updated', {id:String(invoice.booking)});
       emitToAdminModule(MODULES.PAYMENT_HISTORY, 'invoice:updated', {id:String(invoice._id),bookingId:String(invoice.booking)});
       getIO()?.to(`company:${invoice.company}`).emit('invoice:updated', {id:String(invoice._id),bookingId:String(invoice.booking)});
@@ -184,6 +201,7 @@ export const reviewPayment = asyncHandler(async (req,res) => {
     data: {id:booking._id,bookingId:booking._id,invoiceId:invoice._id},
   }).catch(error=>console.error('[GATE_IN_CLIENT_ALERT_FAILED]',{paymentId:String(payment._id),message:error.message}));
   try {
+    clearSummaryCache();
     emitToAdminModule(MODULES.GATE_IN,'gate-in:updated',{id:String(booking._id),bookingReference:booking.bookingReference});
     getIO()?.to(`company:${booking.company}`).emit('pre-advice:workflow-updated',{
       id:String(booking._id),workflowStage:booking.workflowStage,workflowHistory:booking.workflowHistory,gateIn:booking.gateIn,updatedAt:booking.updatedAt,

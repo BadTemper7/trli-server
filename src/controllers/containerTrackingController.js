@@ -10,6 +10,11 @@ import {validateHistoryChronology,HISTORIC_STATUSES} from '../utils/containerTra
 import {canPrintHistorical,canPrintGateIn,canPrintGateOut} from '../utils/passAccess.js';
 import {renderGatePassPdf} from '../services/printableDocuments.js';
 import {calculateInvoice} from '../services/invoicingService.js';
+import { buildContainerFilters } from '../services/tableFilters.js';
+import { getContainerSummary } from '../services/tableSummaries.js';
+import { pageOptions } from '../utils/tableQuery.js';
+import { parseContainerCursor, serializeContainerCursor, sourceAfterCursor, compareContainers } from '../utils/containerCursor.js';
+import { clearSummaryCache } from '../utils/summaryCache.js';
 import {auditAdminAction} from '../services/adminAuditService.js';
 import {hasPermission} from '../middleware/requirePermission.js';
 import {MODULES,ACTIONS} from '../constants/permissions.js';
@@ -50,32 +55,48 @@ async function ensureNoActiveDuplicate(number,exclude=null){
   ]);
   if(live||legacy)throw new AppError('An active container with this number already exists. Record historical movement separately only after its previous release.',409);
 }
-function safeDayFilter(query){let from=null,to=null;for(const key of ['from','to'])if(query[key]&&!/^\d{4}-\d{2}-\d{2}$/.test(query[key]))throw new AppError('Invalid date filter.',400);
-  if(query.from)from=new Date(`${query.from}T00:00:00+08:00`);
-  if(query.to)to=new Date(new Date(`${query.to}T00:00:00+08:00`).getTime()+86400000);
-  return {from,to};}
-export const listContainers=asyncHandler(async(req,res)=>{
-  const {from,to}=safeDayFilter(req.query);const filter={deletedAt:null};
-  // Only administrators can inspect archived tracking records. Clients are
-  // restricted to active records belonging to their verified company.
-  if(!req.companyId && truthy(req.query.includeDeleted)) delete filter.deletedAt;
-  if(req.query.company){if(!isValid(req.query.company))throw new AppError('Invalid company.',400);filter.company=req.query.company;}
-  if(req.companyId)filter.company=req.companyId;
-  if(req.query.search)filter.containerNumber=searchRx(req.query.search);
-  const liveFilter={...filter},historicFilter={...filter};
-  if(req.query.status){const st=String(req.query.status).toUpperCase();historicFilter.status=st;const stat={STORED:{'storage.status':'STORED'},RELEASED:{'gateOut.releasedAt':{$ne:null}},GATE_OUT_APPROVED:{'gateOut.approvedAt':{$ne:null},'gateOut.releasedAt':null},GATED_IN:{'gateIn.actualGateInAt':{$ne:null},'storage.status':{$ne:'STORED'},'gateOut.approvedAt':null},BOOKED:{'gateIn.actualGateInAt':null},CANCELLED:{status:'CANCELLED'}};Object.assign(liveFilter,stat[st]||{workflowStage:st});}
-  if(from||to){const range={...(from?{$gte:from}:{}),...(to?{$lt:to}:{})};liveFilter.createdAt=range;historicFilter.$or=[{originTransactionDate:range},{createdAt:range}];}
-  const page=Math.max(1,parseInt(req.query.page)||1),limit=Math.min(100,Math.max(5,parseInt(req.query.limit)||25));
-  // Fetch the first page*limit of each ordered source, then merge them. This
-  // paginates across both collections without an arbitrary 800-record ceiling.
+// A cursor merges LIVE and HISTORICAL sources without fetching page*limit
+// records into Express memory. The offset branch remains for old consumers.
+const LIVE_FIELDS = 'bookingReference company containerNumber containerSize containerType loadStatus transactionClassification shippingLine status workflowStage gateIn storage gateOut createdAt deletedAt';
+const HISTORICAL_FIELDS = 'bookingReference company containerNumber containerSize containerType loadStatus transactionClassification shippingLine status gateIn storage gateOut createdAt originTransactionDate deletedAt';
+export const listContainers = asyncHandler(async(req,res)=>{
+  const filters = buildContainerFilters(req.query,{company:req.companyId||null,isAdmin:!req.companyId});
+  const paging = pageOptions(req.query,{defaultLimit:25,maxLimit:100,sorts:['createdAt']});
+  // This two-collection merge is intentionally newest-first. Never silently
+  // accept an ascending order that the cursor comparator cannot honor.
+  if (paging.order !== 'desc') throw new AppError('Container tracking supports descending creation order only.',400);
+  if (paging.paginationMode === 'cursor') {
+    const cursor = parseContainerCursor(req.query, filters);
+    const [live, historical] = await Promise.all([
+      PreAdvice.find(sourceAfterCursor(filters.live,cursor,'LIVE')).select(LIVE_FIELDS)
+        .populate('company','companyName').sort({createdAt:-1,_id:-1}).limit(paging.limit+1).lean(),
+      HistoricalContainer.find(sourceAfterCursor(filters.historical,cursor,'HISTORICAL')).select(HISTORICAL_FIELDS)
+        .populate('company','companyName').sort({createdAt:-1,_id:-1}).limit(paging.limit+1).lean(),
+    ]);
+    const merged=[...live.map(x=>dto(x,'LIVE')),...historical.map(x=>dto(x,'HISTORICAL'))].sort(compareContainers);
+    const hasMore=merged.length>paging.limit;
+    const items=merged.slice(0,paging.limit);
+    const nextCursor=hasMore?serializeContainerCursor(items.at(-1),filters):null;
+    return res.json({success:true,data:{items,limit:paging.limit,nextCursor,hasMore,
+      pagination:{limit:paging.limit,nextCursor,hasMore}}});
+  }
+  // Legacy offset pagination retained so deployed portals and integrations do
+  // not break; cursor mode is recommended for deep pages / >100k containers.
   const [live,historical,liveTotal,historicalTotal]=await Promise.all([
-    PreAdvice.find(liveFilter).select('bookingReference company containerNumber containerSize containerType loadStatus transactionClassification shippingLine status workflowStage gateIn storage gateOut createdAt').populate('company','companyName').sort({createdAt:-1}).limit(page*limit).lean(),
-    HistoricalContainer.find(historicFilter).populate('company','companyName').sort({createdAt:-1}).limit(page*limit).lean(),
-    PreAdvice.countDocuments(liveFilter),HistoricalContainer.countDocuments(historicFilter),
+    PreAdvice.find(filters.live).select(LIVE_FIELDS).populate('company','companyName')
+      .sort({createdAt:-1,_id:-1}).limit(paging.page*paging.limit).lean(),
+    HistoricalContainer.find(filters.historical).select(HISTORICAL_FIELDS).populate('company','companyName')
+      .sort({createdAt:-1,_id:-1}).limit(paging.page*paging.limit).lean(),
+    PreAdvice.countDocuments(filters.live),HistoricalContainer.countDocuments(filters.historical),
   ]);
-  const rows=[...live.map(x=>dto(x,'LIVE')),...historical.map(x=>dto(x,'HISTORICAL'))]
-    .sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
-  return res.json({success:true,data:{items:rows.slice((page-1)*limit,page*limit),total:liveTotal+historicalTotal,page,limit}});
+  const rows=[...live.map(x=>dto(x,'LIVE')),...historical.map(x=>dto(x,'HISTORICAL'))].sort(compareContainers);
+  const total=liveTotal+historicalTotal;
+  res.json({success:true,data:{items:rows.slice((paging.page-1)*paging.limit,paging.page*paging.limit),
+    total,page:paging.page,limit:paging.limit,pages:Math.ceil(total/paging.limit)}});
+});
+export const containersSummary = asyncHandler(async(req,res)=>{
+  const {scope,summary}=await getContainerSummary(req.query,req.companyId||null,!req.companyId);
+  res.json({success:true,data:{...summary,scope,summary}});
 });
 export const adminContainers=listContainers;
 export const clientContainers=(req,res,next)=>{req.companyId=req.user.company._id;return listContainers(req,res,next);};
@@ -105,6 +126,7 @@ export const addHistorical=asyncHandler(async(req,res)=>{
     await doc.save({session});
     await auditAdminAction({performedBy:req.admin._id,action:'HISTORICAL_CONTAINER_IMPORTED',changes:{id:String(doc._id),containerNumber:doc.containerNumber},session});
   });} finally {await session.endSession();}
+  clearSummaryCache();
   res.status(201).json({success:true,data:{item:dto(doc.toObject(),'HISTORICAL')}});
 });
 export const editContainer=asyncHandler(async(req,res)=>{
@@ -162,6 +184,7 @@ export const editContainer=asyncHandler(async(req,res)=>{
       await auditAdminAction({performedBy:req.admin._id,action:'HISTORICAL_CONTAINER_CORRECTED',changes:{id:String(doc._id),updates},session});
     });} finally {await session.endSession();}
   }
+  clearSummaryCache();
   res.json({success:true,message:'Container changes saved and audited.'});
 });
 export const deleteContainer=asyncHandler(async(req,res)=>{
@@ -184,6 +207,7 @@ export const deleteContainer=asyncHandler(async(req,res)=>{
       await auditAdminAction({performedBy:req.admin._id,action:'CONTAINER_SOFT_DELETED',changes:{source,id,containerNumber:doc.containerNumber},session});
     });
   } finally {await session.endSession();}
+  clearSummaryCache();
   res.json({success:true,message:'Container archived. Financial and audit history are retained.'});
 });
 export const printPass=asyncHandler(async(req,res)=>{

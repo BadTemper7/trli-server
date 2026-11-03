@@ -23,7 +23,10 @@
     "audit:financial-refs": "node scripts/reconcileFinancialReferences.js",
     "migrate:container-tracking": "node scripts/migrateContainerTracking.js",
     "migrate:flexible-rates": "node scripts/migrateFlexibleRates.js",
-    "migrate:notification-indexes": "node scripts/migrateNotificationIndexes.js"
+    "migrate:notification-indexes": "node scripts/migrateNotificationIndexes.js",
+    "migrate:table-indexes": "node scripts/setupTableIndexes.js",
+    "explain:tables": "node scripts/explainTableQueries.js",
+    "benchmark:tables": "node scripts/benchmarkTableQueries.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",

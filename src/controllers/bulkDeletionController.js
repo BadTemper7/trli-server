@@ -23,6 +23,8 @@ import { MODULES, ACTIONS } from '../constants/permissions.js';
 import {hasPermission} from '../middleware/requirePermission.js';
 import {auditAdminAction} from '../services/adminAuditService.js';
 import {AppError,asyncHandler} from '../utils/http.js';
+import { dateRange, scalar, listDocuments } from '../utils/tableQuery.js';
+import { clearSummaryCache } from '../utils/summaryCache.js';
 import {includesIssuedFinancialRecords,acknowledgedFinancialDeletion} from '../utils/financialDeletionPolicy.js';
 
 // Gate-in, Gate-out, Inventory, Release, and Pre-advice are views of the SAME
@@ -227,14 +229,29 @@ export const deleteRecords=asyncHandler(async(req,res)=>{
   } finally{await session.endSession();}
   const fileFailures=await cleanupFiles(files);
   if(fileFailures.length){try{await auditAdminAction({performedBy:req.admin._id,action:'DELETE_FILE_CLEANUP_FAILED',changes:{module:parsed.module,files:fileFailures}});}catch{}}
+  clearSummaryCache();
   res.json({success:true,message:`${result.count} record(s) deleted and logged.`,data:{...result,fileCleanupWarnings:fileFailures.length}});
 });
 
+export function buildAuditFilter(query = {}) {
+  const filter = {};
+  const action = scalar(query, 'action');
+  if (action) {
+    if (action.length > 90 || !/^[A-Za-z0-9_:-]+$/.test(action)) throw new AppError('Invalid audit action.', 400);
+    filter.action = action;
+  }
+  const range = dateRange(query);
+  if (range) filter.createdAt = range;
+  return filter;
+}
 export const auditLogs=asyncHandler(async(req,res)=>{
-  const page=Math.max(1,Math.floor(Number(req.query.page)||1)),limit=Math.min(100,Math.max(1,Math.floor(Number(req.query.limit)||25)));
-  const filter={};
-  if(req.query.action)filter.action=String(req.query.action).trim().slice(0,90);
-  if(req.query.from||req.query.to){filter.createdAt={};if(req.query.from){if(!/^\d{4}-\d{2}-\d{2}$/.test(req.query.from))throw new AppError('Invalid start date.',400);filter.createdAt.$gte=new Date(`${req.query.from}T00:00:00+08:00`);}if(req.query.to){if(!/^\d{4}-\d{2}-\d{2}$/.test(req.query.to))throw new AppError('Invalid end date.',400);filter.createdAt.$lt=new Date(new Date(`${req.query.to}T00:00:00+08:00`).getTime()+86400000);}}
-  const [rows,total]=await Promise.all([AdminAuditLog.find(filter).populate('performedBy','firstName lastName email').sort({createdAt:-1}).skip((page-1)*limit).limit(limit).lean(),AdminAuditLog.countDocuments(filter)]);
-  res.json({success:true,data:{items:rows,total,page,limit}});
+  const filter = buildAuditFilter(req.query);
+  const { items, pagination } = await listDocuments(AdminAuditLog, filter, req.query, {
+    defaultLimit: 25, maxLimit: 100, sorts: ['createdAt', '_id'],
+    select: 'performedBy targetUser action changes createdAt',
+    populate: { path: 'performedBy', select: 'firstName lastName email' },
+  });
+  res.json({ success: true, data: { items, total: pagination.total ?? null,
+    page: pagination.page, limit: pagination.limit, pages: pagination.pages ?? null,
+    nextCursor: pagination.nextCursor ?? null, hasMore: pagination.hasMore ?? (pagination.page < pagination.totalPages) } });
 });
