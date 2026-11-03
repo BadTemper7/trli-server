@@ -10,11 +10,14 @@ import { nextReference } from '../utils/referenceNumbers.js';
 import { AppError, asyncHandler } from '../utils/http.js';
 import { auditAdminAction } from '../services/adminAuditService.js';
 import { renderFinancialPdf } from '../services/pdfDocuments.js';
+import { renderServiceInvoicePdf } from '../services/printableDocuments.js';
+import SiteSettings from '../models/SiteSettings.js';
 import { validateUploadedProof, validatePaymentEvidence } from '../services/paymentProofValidation.js';
 import { enqueueBookingMail } from '../services/transactionalMail.js';
 import { advanceWorkflow } from '../utils/preAdviceWorkflow.js';
 import { emitToAdminModule, getIO } from '../socket/index.js';
 import { MODULES } from '../constants/permissions.js';
+import {paymentReviewFailure} from '../utils/financialReviewErrors.js';
 
 const owner = (req) => req.user.company._id;
 const filterFor = (req) => req.user ? { company: owner(req) } : {};
@@ -95,38 +98,62 @@ export const reviewPayment = asyncHandler(async (req,res) => {
   const decision=String(req.body.decision||'').toUpperCase(),reason=String(req.body.reason||'').trim().slice(0,800);
   if(!['APPROVE','REJECT'].includes(decision))throw new AppError('Decision must be APPROVE or REJECT.',400);
   if(decision==='REJECT'&&!reason)throw new AppError('Rejection reason is required.',400);
+  if(!mongoose.isValidObjectId(req.params.id))throw new AppError('Invalid payment identifier.',400);
   const session=await mongoose.startSession();
   let payment,invoice,booking;
-  try{
+  try {
     await session.withTransaction(async()=>{
       payment=await PaymentSubmission.findOne({_id:req.params.id,status:'PENDING_VERIFICATION'}).session(session);
-      if(!payment)throw new AppError('Payment is not awaiting review.',409);
+      if(!payment) {
+        const existing=await PaymentSubmission.findById(req.params.id).session(session).lean();
+        throw new AppError(existing?.status==='VERIFIED'?'This payment has already been verified. Refresh the Gate-in drawer.':
+          existing?.status==='REJECTED'?'This payment has already been rejected. Refresh the Gate-in drawer.':'Payment is not awaiting verification.',409);
+      }
       invoice=await Invoice.findOne({_id:payment.invoice,status:'PAYMENT_SUBMITTED',type:'GATE_IN'}).session(session);
-      if(!invoice)throw new AppError('Gate-in invoice is not awaiting review.',409);
+      if(!invoice)throw new AppError('Gate-in invoice is not awaiting verification. Refresh the booking.',409);
       booking=await PreAdvice.findById(payment.booking).session(session);
-      if(!booking||!['READY_FOR_GATE_IN','GATE_IN_PAYMENT_SUBMITTED'].includes(booking.workflowStage))throw new AppError('Booking is not waiting for payment approval.',409);
-      if(decision==='APPROVE'){
-        if(Math.abs(payment.amount-invoice.total)>0.001)throw new AppError('Payment does not match total payable.',409);
-        payment.status='VERIFIED';payment.receiptNumber=await nextReference('RECEIPT',new Date(),session);
+      if(!booking||!['READY_FOR_GATE_IN','GATE_IN_PAYMENT_SUBMITTED'].includes(booking.workflowStage))throw new AppError('Booking is no longer waiting for Gate-in payment verification.',409);
+      if(!booking.gateIn?.payment)throw new AppError('Booking does not have a Gate-in payment state. Contact technical support.',409);
+      if(decision==='APPROVE') {
+        if(!Number.isFinite(Number(payment.amount)) || Math.abs(Number(payment.amount)-Number(invoice.total))>0.001)throw new AppError('Payment amount does not match the invoice total.',409);
+        payment.receiptNumber=await nextReference('RECEIPT',new Date(),session);
+        payment.status='VERIFIED';
         invoice.status='PAID';invoice.paidAmount=invoice.total;invoice.balance=0;invoice.paidAt=new Date();invoice.verifiedBy=req.admin._id;
         booking.gateIn.payment.status='VERIFIED';
-      }else{
+      } else {
         payment.status='REJECTED';payment.rejectionReason=reason;
         invoice.status='UNPAID';booking.gateIn.payment.status='REJECTED';
       }
       payment.verifiedBy=req.admin._id;payment.verifiedAt=new Date();
       await payment.save({session});await invoice.save({session});await booking.save({session});
-      await enqueueBookingMail(booking,{
-        event:decision==='APPROVE'?'GATE_IN_PAYMENT_APPROVED':'GATE_IN_PAYMENT_REJECTED',
-        title:decision==='APPROVE'?'Gate-in payment verified':'Gate-in payment rejected',
-        message:decision==='APPROVE'?'Your online gate-in payment was verified. Your container can proceed to gate-in inspection and entry.':`Your gate-in payment proof was rejected: ${reason}. Please submit a new proof.`,
-        invoiceNumber:invoice.number,amount:payment.amount,
-      },session);
+      // Audit lives in the SAME commit. An audit failure cannot turn an already
+      // verified payment into an HTTP 500 or leave an untracked approval.
+      await auditAdminAction({performedBy:req.admin._id,action:decision==='APPROVE'?'PAYMENT_VERIFIED':'PAYMENT_REJECTED',
+        changes:{invoice:invoice.number,paymentId:String(payment._id),reference:payment.reference,reason},session});
     });
-  }finally{await session.endSession();}
-  await auditAdminAction({performedBy:req.admin._id,action:decision==='APPROVE'?'PAYMENT_VERIFIED':'PAYMENT_REJECTED',changes:{invoice:invoice.number,reference:payment.reference,reason}});
-  emitToAdminModule(MODULES.GATE_IN,'gate-in:updated',{id:String(booking._id),bookingReference:booking.bookingReference});
-  getIO()?.to(`company:${booking.company}`).emit('pre-advice:workflow-updated',{id:String(booking._id),workflowStage:booking.workflowStage,workflowHistory:booking.workflowHistory,gateIn:booking.gateIn,updatedAt:booking.updatedAt});
+  } catch (error) {
+    const translated=paymentReviewFailure(error);
+    if (translated===error && !error?.status) console.error('[GATE_IN_PAYMENT_REVIEW_FAILED]',{
+      paymentId:String(req.params.id),errorName:error?.name,errorCode:error?.code,message:error?.message,
+    });
+    throw translated;
+  } finally { await session.endSession(); }
+
+  // Notifications must not change the result of a COMMITTED financial action.
+  try {
+    await enqueueBookingMail(booking,{
+      event:decision==='APPROVE'?'GATE_IN_PAYMENT_APPROVED':'GATE_IN_PAYMENT_REJECTED',
+      title:decision==='APPROVE'?'Gate-in payment verified':'Gate-in payment rejected',
+      message:decision==='APPROVE'?'Your online Gate-in payment has been verified. Await terminal inspection and physical Gate-in.':`Your Gate-in payment was rejected: ${reason}. Submit corrected evidence.`,
+      invoiceNumber:invoice.number,amount:payment.amount,
+    });
+  } catch(error) { console.error('[GATE_IN_PAYMENT_NOTIFICATION_RETRY_NEEDED]',{paymentId:String(payment._id),message:error.message}); }
+  try {
+    emitToAdminModule(MODULES.GATE_IN,'gate-in:updated',{id:String(booking._id),bookingReference:booking.bookingReference});
+    getIO()?.to(`company:${booking.company}`).emit('pre-advice:workflow-updated',{
+      id:String(booking._id),workflowStage:booking.workflowStage,workflowHistory:booking.workflowHistory,gateIn:booking.gateIn,updatedAt:booking.updatedAt,
+    });
+  } catch(error) {console.error('[GATE_IN_PAYMENT_SOCKET_ERROR]',{paymentId:String(payment._id),message:error.message});}
   res.json({success:true,message:decision==='APPROVE'?'Gate-in payment verified.':'Payment rejected; client may submit replacement proof.',data:{payment}});
 });
 export const listPendingPayments = asyncHandler(async (req,res) => {
@@ -162,7 +189,8 @@ export const downloadFinancialPdf = asyncHandler(async (req,res) => {
   const booking=await PreAdvice.findById(invoice.booking).select('bookingReference containerNumber').lean();
   const ClientCompany=(await import('../models/ClientCompany.js')).default;
   const company=await ClientCompany.findById(invoice.company).select('companyName').lean();
-  const pdf=renderFinancialPdf({invoice,booking,companyName:company?.companyName,payment});
+  const settings=receipt?null:await SiteSettings.findOne({key:'COMPANY_CONTACT'}).lean();
+  const pdf=receipt?renderFinancialPdf({invoice,booking,companyName:company?.companyName,payment}):renderServiceInvoicePdf({invoice,booking,companyName:company?.companyName,settings});
   res.type('application/pdf').set('Cache-Control','private,no-store')
     .set('Content-Disposition',`attachment; filename="${receipt?payment.receiptNumber:invoice.number}-${receipt?'receipt':'invoice'}.pdf"`)
     .send(pdf);

@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import {downloadGateInPass,downloadGateOutPass,downloadReleasePass,downloadOperationalInvoice} from '../controllers/printableController.js';
 import { adminAuth, requirePasswordChanged } from '../middleware/adminAuth.js';
 import { requirePermission } from '../middleware/requirePermission.js';
 import { validateId } from '../middleware/validateId.js';
@@ -20,6 +21,8 @@ router.post('/pre-advice/:id/approve', validateId(), requirePermission(MODULES.P
 router.post('/pre-advice/:id/reject', validateId(), requirePermission(MODULES.PRE_ADVICE, ACTIONS.EDIT), rejectPreAdvice);
 
 router.get('/gate-in', requirePermission(MODULES.GATE_IN, ACTIONS.VIEW), listGateIn);
+router.get('/gate-in/:id/pass',validateId(),requirePermission(MODULES.GATE_IN,ACTIONS.VIEW),downloadGateInPass);
+router.get('/gate-in/:id/invoice',validateId(),requirePermission(MODULES.GATE_IN,ACTIONS.VIEW),(req,res,next)=>{req.params.type='gate-in';return downloadOperationalInvoice(req,res,next);});
 router.post('/gate-in/:id/inspection', validateId(), requirePermission(MODULES.GATE_IN, ACTIONS.PROCESS), inspectGateIn);
 
 
@@ -29,11 +32,15 @@ router.get('/inventory', requirePermission(MODULES.INVENTORY, ACTIONS.VIEW), lis
 router.put('/inventory/:id', validateId(), requirePermission(MODULES.INVENTORY, ACTIONS.EDIT), updateInventory);
 
 router.get('/gate-out', requirePermission(MODULES.GATE_OUT, ACTIONS.VIEW), listGateOut);
+router.get('/gate-out/:id/pass',validateId(),requirePermission(MODULES.GATE_OUT,ACTIONS.VIEW),downloadGateOutPass);
+router.get('/gate-out/:id/invoice',validateId(),requirePermission(MODULES.GATE_OUT,ACTIONS.VIEW),(req,res,next)=>{req.params.type='gate-out';return downloadOperationalInvoice(req,res,next);});
 
 
 
 
 router.get('/release', requirePermission(MODULES.RELEASE_CONTAINER, ACTIONS.VIEW), listRelease);
+router.get('/release/:id/pass',validateId(),requirePermission(MODULES.RELEASE_CONTAINER,ACTIONS.VIEW),downloadReleasePass);
+router.get('/release/:id/invoice',validateId(),requirePermission(MODULES.RELEASE_CONTAINER,ACTIONS.VIEW),(req,res,next)=>{req.params.type='gate-out';return downloadOperationalInvoice(req,res,next);});
 router.post('/release/:id', validateId(), requirePermission(MODULES.RELEASE_CONTAINER, ACTIONS.PROCESS), releaseContainer);
 
 export default router;

@@ -2,6 +2,8 @@ import mongoose from 'mongoose';
 import fs from 'fs/promises';
 import path from 'path';
 import {renderFinancialPdf} from '../services/pdfDocuments.js';
+import {renderServiceInvoicePdf} from '../services/printableDocuments.js';
+import SiteSettings from '../models/SiteSettings.js';
 import ClientCompany from '../models/ClientCompany.js';
 import PreAdvice from '../models/PreAdvice.js';
 import Invoice from '../models/Invoice.js';
@@ -158,6 +160,7 @@ export const adminGateOutPdf=asyncHandler(async(req,res)=>{
  const payment=receipt?await PaymentSubmission.findOne({invoice:invoice._id,status:'VERIFIED'}).lean():null;
  if(receipt&&!payment?.receiptNumber)throw new AppError('Receipt not yet verified.',409);
  const company=await ClientCompany.findById(booking.company).select('companyName').lean();
- const pdf=renderFinancialPdf({booking,invoice,companyName:company?.companyName,payment});
+ const settings=receipt?null:await SiteSettings.findOne({key:'COMPANY_CONTACT'}).lean();
+ const pdf=receipt?renderFinancialPdf({booking,invoice,companyName:company?.companyName,payment}):renderServiceInvoicePdf({booking,invoice,companyName:company?.companyName,settings});
  res.type('application/pdf').set('Cache-Control','private,no-store').set('Content-Disposition',`attachment; filename="${receipt?payment.receiptNumber:invoice.number}-${receipt?'receipt':'invoice'}.pdf"`).send(pdf);
 });

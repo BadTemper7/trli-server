@@ -7,6 +7,8 @@ function sanitize(value) {
   return Object.fromEntries(Object.entries(value).filter(([k]) => !blockedKeys.has(k)).map(([k,v]) => [k, sanitize(v)]));
 }
 
-export async function auditAdminAction({ performedBy = null, targetUser = null, action, changes = {} }) {
-  return AdminAuditLog.create({ performedBy, targetUser, action, changes: sanitize(changes) });
+export async function auditAdminAction({ performedBy = null, targetUser = null, action, changes = {}, session = null }) {
+  const record = { performedBy, targetUser, action, changes: sanitize(changes) };
+  if (session) return (await AdminAuditLog.create([record], { session }))[0];
+  return AdminAuditLog.create(record);
 }
