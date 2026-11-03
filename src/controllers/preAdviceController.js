@@ -168,8 +168,8 @@ export const create = asyncHandler(async (req, res) => {
     type: 'PRE_ADVICE_CREATED',
     title: 'New Pre-advice',
     message: `${item.bookingReference} was submitted.`,
-    data: { id: item._id },
-  });
+    data: { id: item._id, bookingId: item._id, bookingReference: item.bookingReference },
+  }).catch(error => console.error('[PRE_ADVICE_NOTIFICATION_FAILED]', {bookingId:String(item._id),message:error.message}));
 
   ok(res, { item }, 'Pre-advice created.');
 });
@@ -261,8 +261,8 @@ export const cancel = asyncHandler(async (req, res) => {
     type: 'PRE_ADVICE_CANCELLED',
     title: 'Booking Cancelled',
     message: `${item.bookingReference} was cancelled by the client.`,
-    data: { id: item._id, reason },
-  });
+    data: { id: item._id, bookingId: item._id, reason },
+  }).catch(error => console.error('[PRE_ADVICE_NOTIFICATION_FAILED]', {bookingId:String(item._id),message:error.message}));
 
   ok(res, { item }, 'Booking cancelled.');
 });

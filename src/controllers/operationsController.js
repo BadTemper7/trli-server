@@ -190,8 +190,8 @@ async function notifyWorkflow(item, module, event, title, message) {
       type: event.toUpperCase().replace(/[:\-]/g, '_'),
       title,
       message,
-      data: { id: item._id, bookingReference: item.bookingReference, workflowStage: item.workflowStage },
-    });
+      data: { id: item._id, bookingId: item._id, bookingReference: item.bookingReference, workflowStage: item.workflowStage },
+    }).catch(error => console.error('[WORKFLOW_NOTIFICATION_FAILED]', {bookingId:String(item._id),message:error.message}));
   }
   return payload;
 }
@@ -620,12 +620,12 @@ export const releaseContainer = asyncHandler(async (req,res) => {
       await item.save({session});
       if(oldStorage?.block)await StorageMovement.create([{container:item._id,action:'REMOVED',from:oldStorage,performedBy:adminId(req),performedAt:now}],{session});
       await enqueueBookingMail(item,{event:'CONTAINER_RELEASED',title:'Container released',message:`Your container was physically released on ${now.toLocaleString('en-PH',{timeZone:'Asia/Manila'})}.`},session);
+      await auditAdminAction({performedBy:req.admin._id,action:'CONTAINER_RELEASED',changes:{bookingReference:item.bookingReference,containerNumber:item.containerNumber},session});
       id=item._id;
     });
   }finally{await session.endSession();}
-  if(oldStorage?.block)await emitStorageOccupancy(oldStorage.block);
+  if(oldStorage?.block)await emitStorageOccupancy(oldStorage.block).catch(error=>console.error('[RELEASE_OCCUPANCY_EVENT_FAILED]',{bookingId:String(id),message:error.message}));
   const item=await findItem(id);
-  await auditAdminAction({performedBy:req.admin._id,action:'CONTAINER_RELEASED',changes:{bookingReference:item.bookingReference,containerNumber:item.containerNumber}});
   const data=await notifyWorkflow(item,MODULES.RELEASE_CONTAINER,'release:completed','Container Released',`${item.containerNumber} has been physically released.`);
   emitToAdminModule(MODULES.INVENTORY,'inventory:updated',data);
   emitToAdminModule(MODULES.STORAGE_MONITORING,'storage:container-removed',{id:String(item._id),containerNumber:item.containerNumber});

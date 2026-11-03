@@ -18,6 +18,7 @@ import { advanceWorkflow } from '../utils/preAdviceWorkflow.js';
 import { emitToAdminModule, getIO } from '../socket/index.js';
 import { MODULES } from '../constants/permissions.js';
 import {paymentReviewFailure} from '../utils/financialReviewErrors.js';
+import { createNotification } from '../services/notificationService.js';
 
 const owner = (req) => req.user.company._id;
 const filterFor = (req) => req.user ? { company: owner(req) } : {};
@@ -67,13 +68,14 @@ export const submitProof = asyncHandler(async (req,res) => {
       throw new AppError('This payment reference is already in use for an active or verified submission.',409);
     }
     const session=await mongoose.startSession();
-    let payment,invoice;
+    let payment,invoice,bookingReference;
     try{
       await session.withTransaction(async()=>{
         invoice=await Invoice.findOne({_id:req.params.id,company:owner(req),type:'GATE_IN',status:'UNPAID'}).session(session);
         if(!invoice)throw new AppError('Gate-in invoice is not available for payment.',409);
         const booking=await PreAdvice.findOne({_id:invoice.booking,company:owner(req)}).session(session);
         if(!booking||!['READY_FOR_GATE_IN','GATE_IN_PAYMENT_SUBMITTED'].includes(booking.workflowStage))throw new AppError('Booking is not eligible for gate-in payment.',409);
+        bookingReference=booking.bookingReference;
         const amount=Number(req.body.amount);
         if(!Number.isFinite(amount)||Math.abs(amount-invoice.total)>0.001)throw new AppError('Payment amount must match the invoice.',400);
         payment=(await PaymentSubmission.create([{
@@ -90,6 +92,19 @@ export const submitProof = asyncHandler(async (req,res) => {
       });
       committed=true;
     }finally{await session.endSession();}
+    // Never re-run a committed payment operation if an alert cannot be sent.
+    try {
+      await createNotification({
+        company: invoice.company, audience: 'ADMIN', type: 'GATE_IN_PAYMENT_SUBMITTED',
+        title: 'Gate-in payment awaiting verification',
+        message: `Payment proof was submitted for ${bookingReference || invoice.number}.`,
+        data: { id: invoice.booking, bookingId: invoice.booking, bookingReference, invoiceId: invoice._id, paymentId: payment._id },
+      });
+      emitToAdminModule(MODULES.GATE_IN, 'gate-in:updated', {id:String(invoice.booking)});
+      emitToAdminModule(MODULES.PAYMENT_HISTORY, 'invoice:updated', {id:String(invoice._id),bookingId:String(invoice.booking)});
+      getIO()?.to(`company:${invoice.company}`).emit('invoice:updated', {id:String(invoice._id),bookingId:String(invoice.booking)});
+      getIO()?.to(`company:${invoice.company}`).emit('pre-advice:workflow-updated', {id:String(invoice.booking),workflowStage:'GATE_IN_PAYMENT_SUBMITTED'});
+    } catch (error) {console.error('[GATE_IN_PAYMENT_ALERT_FAILED]', {paymentId:String(payment._id),message:error.message});}
     res.json({success:true,message:'Payment evidence submitted; administrator verification is required.',data:{paymentId:payment._id,invoice}});
   }catch(e){if(!committed&&proof?.path)await fs.unlink(proof.path).catch(()=>{});throw e;}
 });
@@ -161,11 +176,20 @@ export const reviewPayment = asyncHandler(async (req,res) => {
       invoiceNumber:invoice.number,amount:payment.amount,
     });
   } catch(error) { console.error('[GATE_IN_PAYMENT_NOTIFICATION_RETRY_NEEDED]',{paymentId:String(payment._id),message:error.message}); }
+  await createNotification({
+    company: booking.company, audience: 'CLIENT',
+    type: decision==='APPROVE'?'GATE_IN_PAYMENT_APPROVED':'GATE_IN_PAYMENT_REJECTED',
+    title: decision==='APPROVE'?'Gate-in payment verified':'Gate-in payment rejected',
+    message: decision==='APPROVE'?'Your Gate-in payment was verified. Await terminal inspection.':`Gate-in payment rejected: ${reason}`,
+    data: {id:booking._id,bookingId:booking._id,invoiceId:invoice._id},
+  }).catch(error=>console.error('[GATE_IN_CLIENT_ALERT_FAILED]',{paymentId:String(payment._id),message:error.message}));
   try {
     emitToAdminModule(MODULES.GATE_IN,'gate-in:updated',{id:String(booking._id),bookingReference:booking.bookingReference});
     getIO()?.to(`company:${booking.company}`).emit('pre-advice:workflow-updated',{
       id:String(booking._id),workflowStage:booking.workflowStage,workflowHistory:booking.workflowHistory,gateIn:booking.gateIn,updatedAt:booking.updatedAt,
     });
+    getIO()?.to(`company:${booking.company}`).emit('invoice:updated',{bookingId:String(booking._id),id:String(invoice._id)});
+    emitToAdminModule(MODULES.PAYMENT_HISTORY,'invoice:updated',{bookingId:String(booking._id),id:String(invoice._id)});
   } catch(error) {console.error('[GATE_IN_PAYMENT_SOCKET_ERROR]',{paymentId:String(payment._id),message:error.message});}
   res.json({success:true,message:decision==='APPROVE'?'Gate-in payment verified.':'Payment rejected; client may submit replacement proof.',data:{payment}});
 });

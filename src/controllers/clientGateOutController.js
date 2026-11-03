@@ -95,9 +95,11 @@ export const requestClientGateOut=asyncHandler(async(req,res)=>{
    });
    committed=true;
   }finally{await session.endSession();}
-  await createNotification({company:booking.company,audience:'ADMIN',type:'GATE_OUT_REQUESTED',title:'Gate-out request ready for review',message:`${booking.bookingReference} submitted a gate-out request and payment proof.`,data:{id:booking._id}}).catch(console.error);
+  await createNotification({company:booking.company,audience:'ADMIN',type:'GATE_OUT_REQUESTED',title:'Gate-out request ready for review',message:`${booking.bookingReference} submitted a gate-out request and payment proof.`,data:{id:booking._id,bookingId:booking._id,bookingReference:booking.bookingReference}}).catch(console.error);
   emitToAdminModule(MODULES.GATE_OUT,'gate-out:updated',{id:String(booking._id),bookingReference:booking.bookingReference});
+  emitToAdminModule(MODULES.PAYMENT_HISTORY,'invoice:updated',{bookingId:String(booking._id)});
   getIO()?.to(`company:${booking.company}`).emit('pre-advice:workflow-updated',{id:String(booking._id),workflowStage:'GATE_OUT_PAYMENT_SUBMITTED'});
+  getIO()?.to(`company:${booking.company}`).emit('invoice:updated',{bookingId:String(booking._id)});
   res.json({success:true,message:'Gate-out request and payment submitted for verification.',data:{bookingId:booking._id}});
  }catch(e){if(!committed&&file?.path)await fs.unlink(file.path).catch(()=>{});throw e;}
 });
@@ -192,8 +194,24 @@ export const reviewClientGateOut=asyncHandler(async(req,res)=>{
  try{
   emitToAdminModule(MODULES.GATE_OUT,decision==='APPROVE'?'gate-out:approved':'gate-out:updated',{id:String(booking._id),bookingReference:booking.bookingReference});
   if(decision==='APPROVE')emitToAdminModule(MODULES.RELEASE_CONTAINER,'release:queue-updated',{id:String(booking._id),bookingReference:booking.bookingReference});
+  emitToAdminModule(MODULES.PAYMENT_HISTORY,'invoice:updated',{bookingId:String(booking._id)});
   getIO()?.to(`company:${booking.company}`).emit('pre-advice:workflow-updated',{id:String(booking._id),workflowStage:booking.workflowStage,workflowHistory:booking.workflowHistory,gateOut:booking.gateOut,updatedAt:booking.updatedAt});
  }catch(error){console.error('[GATE_OUT_SOCKET_ERROR]',{paymentId:String(payment._id),message:error?.message});}
+ await createNotification({
+  company:booking.company,audience:'CLIENT',
+  type:decision==='APPROVE'?'GATE_OUT_APPROVED':'GATE_OUT_REJECTED',
+  title:decision==='APPROVE'?'Gate-out approved':'Gate-out requires attention',
+  message:decision==='APPROVE'?'Your Gate-out payment was verified. Your container is ready for physical release.':`Gate-out request rejected: ${reason}`,
+  data:{id:booking._id,bookingId:booking._id,bookingReference:booking.bookingReference},
+ }).catch(error=>console.error('[GATE_OUT_CLIENT_ALERT_FAILED]',{bookingId:String(booking._id),message:error.message}));
+ if(decision==='APPROVE')await createNotification({
+  company:booking.company,audience:'ADMIN',module:MODULES.RELEASE_CONTAINER,
+  type:'RELEASE_READY',title:'Container ready for release',
+  message:`${booking.bookingReference} is approved and ready for physical release.`,
+  data:{id:booking._id,bookingId:booking._id,bookingReference:booking.bookingReference},
+ }).catch(error=>console.error('[RELEASE_READY_ALERT_FAILED]',{bookingId:String(booking._id),message:error.message}));
+ try{getIO()?.to(`company:${booking.company}`).emit('invoice:updated',{bookingId:String(booking._id)});}
+ catch(error){console.error('[GATE_OUT_INVOICE_EVENT_FAILED]',{bookingId:String(booking._id),message:error.message});}
  res.json({success:true,message:decision==='APPROVE'?'Payment verified and container approved for release.':'Request rejected. Client may resubmit payment details.',data:{paymentId:String(payment._id)}});
 });
 

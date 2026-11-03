@@ -22,7 +22,8 @@
     "migrate:universal-overtime": "node scripts/migrateUniversalOvertime.js",
     "audit:financial-refs": "node scripts/reconcileFinancialReferences.js",
     "migrate:container-tracking": "node scripts/migrateContainerTracking.js",
-    "migrate:flexible-rates": "node scripts/migrateFlexibleRates.js"
+    "migrate:flexible-rates": "node scripts/migrateFlexibleRates.js",
+    "migrate:notification-indexes": "node scripts/migrateNotificationIndexes.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",
