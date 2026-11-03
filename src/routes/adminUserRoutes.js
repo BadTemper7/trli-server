@@ -1,3 +1,4 @@
+import {deleteRecords} from '../controllers/bulkDeletionController.js';
 import { Router } from 'express';
 import { adminAuth, requirePasswordChanged } from '../middleware/adminAuth.js';
 import { requirePermission } from '../middleware/requirePermission.js';
@@ -10,7 +11,7 @@ r.get('/',requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.VIEW),listUsers);
 r.post('/',requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.CREATE),createUser);
 r.get('/:id',validateId(),requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.VIEW),getUser);
 r.put('/:id',validateId(),requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.EDIT),updateUser);
-r.delete('/:id',validateId(),requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.DELETE),deleteUser);
+r.delete('/:id',validateId(),requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.DELETE),(req,res,next)=>{req.body={...req.body,module:'USER_MANAGEMENT',ids:[req.params.id]};return deleteRecords(req,res,next);});
 r.patch('/:id/status',validateId(),requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.EDIT),updateStatus);
 r.put('/:id/permissions',validateId(),requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.MANAGE_ACCESS),updatePermissions);
 r.post('/:id/reissue-temporary-password',validateId(),requirePermission(MODULES.USER_MANAGEMENT,ACTIONS.RESET_PASSWORD),reissueTemporaryPassword);

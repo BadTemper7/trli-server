@@ -1,3 +1,4 @@
+import {deleteRecords} from '../controllers/bulkDeletionController.js';
 import { Router } from 'express';
 import { ACTIONS, MODULES } from '../constants/permissions.js';
 import { adminAuth, requirePasswordChanged } from '../middleware/adminAuth.js';
@@ -12,5 +13,5 @@ r.post('/import-local', requirePermission(MODULES.RATE_SETUP, ACTIONS.CREATE), i
 r.post('/', requirePermission(MODULES.RATE_SETUP, ACTIONS.CREATE), createRate);
 r.get('/:id', validateId(), requirePermission(MODULES.RATE_SETUP, ACTIONS.VIEW), getRate);
 r.put('/:id', validateId(), requirePermission(MODULES.RATE_SETUP, ACTIONS.EDIT), updateRate);
-r.delete('/:id', validateId(), requirePermission(MODULES.RATE_SETUP, ACTIONS.DELETE), deleteRate);
+r.delete('/:id', validateId(), requirePermission(MODULES.RATE_SETUP, ACTIONS.DELETE), (req,res,next)=>{req.body={...req.body,module:'RATE_SETUP',target:'',ids:[req.params.id]};return deleteRecords(req,res,next);});
 export default r;

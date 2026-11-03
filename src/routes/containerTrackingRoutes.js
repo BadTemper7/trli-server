@@ -1,4 +1,5 @@
 import {Router} from 'express';
+import {deleteRecords} from '../controllers/bulkDeletionController.js';
 import {adminAuth,requirePasswordChanged} from '../middleware/adminAuth.js';
 import {auth} from '../middleware/auth.js';
 import {requirePermission} from '../middleware/requirePermission.js';
@@ -10,7 +11,7 @@ adminTracking.get('/companies',requirePermission(MODULES.CONTAINER_TRACKING,ACTI
 adminTracking.post('/historical',requirePermission(MODULES.CONTAINER_TRACKING,ACTIONS.CREATE),addHistorical);
 adminTracking.get('/:source/:id',requirePermission(MODULES.CONTAINER_TRACKING,ACTIONS.VIEW),adminDetail);
 adminTracking.put('/:source/:id',requirePermission(MODULES.CONTAINER_TRACKING,ACTIONS.EDIT),editContainer);
-adminTracking.delete('/:source/:id',requirePermission(MODULES.CONTAINER_TRACKING,ACTIONS.DELETE),deleteContainer);
+adminTracking.delete('/:source/:id',requirePermission(MODULES.CONTAINER_TRACKING,ACTIONS.DELETE),(req,res,next)=>{req.body={...req.body,module:'CONTAINER_TRACKING',ids:[`${req.params.source}:${req.params.id}`]};return deleteRecords(req,res,next);});
 adminTracking.get('/:source/:id/pass/:type',requirePermission(MODULES.CONTAINER_TRACKING,ACTIONS.VIEW),printPass);
 export const clientTracking=Router();clientTracking.use(auth);
 clientTracking.get('/',clientContainers);

@@ -1,3 +1,4 @@
+import {deleteRecords} from '../controllers/bulkDeletionController.js';
 import { Router } from 'express';
 import { adminAuth, requirePasswordChanged } from '../middleware/adminAuth.js';
 import { requirePermission } from '../middleware/requirePermission.js';
@@ -13,7 +14,7 @@ router.post('/containers/:containerId/relocate',validateId('containerId'),requir
 router.post('/containers/:containerId/remove',validateId('containerId'),requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.EDIT),removeContainer);
 router.get('/blocks/:id',validateId(),requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.VIEW),getBlock);
 router.put('/blocks/:id',validateId(),requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.EDIT),updateBlock);
-router.delete('/blocks/:id',validateId(),requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.DELETE),deleteBlock);
+router.delete('/blocks/:id',validateId(),requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.DELETE),(req,res,next)=>{req.body={...req.body,module:'STORAGE_MONITORING',target:'STORAGE_BLOCK',ids:[req.params.id]};return deleteRecords(req,res,next);});
 router.get('/blocks/:id/containers',validateId(),requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.VIEW),blockContainers);
 router.post('/blocks/:id/assign',validateId(),requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.ASSIGN),assignContainer);
 export default router;
