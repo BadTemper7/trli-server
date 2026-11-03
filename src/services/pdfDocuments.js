@@ -47,8 +47,11 @@ export function renderFinancialPdf({ invoice, booking, companyName, payment = nu
     row(`${line.description} (${line.quantity} x ${fmt(line.unitRate)})`, fmt(line.amount), { amount: true, gap: 23 });
   }
   y -= 10; horizontal(); y -= 20;
-  row('Subtotal', fmt(invoice.subtotal), { amount: true });
-  row(`VAT (${invoice.vatRate || 0}% ${invoice.vatInclusive ? 'inclusive' : 'exclusive'})`, fmt(invoice.vat), { amount: true });
+  const taxable= (invoice.lines||[]).filter(l=>(l.taxTreatment||'TAXABLE')==='TAXABLE').reduce((n,l)=>n+Number(l.amount||0),0);
+  const nonVatable=(invoice.lines||[]).filter(l=>(l.taxTreatment||'TAXABLE')!=='TAXABLE').reduce((n,l)=>n+Number(l.amount||0),0);
+  row('VATable Sales',fmt(taxable-(invoice.vatInclusive?Number(invoice.vat||0):0)),{amount:true});
+  row('Non-VATable Sales',fmt(nonVatable),{amount:true});
+  row('VAT ('+(invoice.vatRate||0)+'%'+(invoice.vatInclusive?' included':' added')+')',fmt(invoice.vat),{amount:true});
   row('Total Payable', fmt(invoice.total), { amount: true, bold: true });
   row('Amount Paid', fmt(receipt ? payment.amount : invoice.paidAmount), { amount: true });
   if (!receipt) row('Remaining Balance', fmt(invoice.balance), { amount: true, bold: true });

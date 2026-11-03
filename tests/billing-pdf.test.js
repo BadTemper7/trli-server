@@ -13,7 +13,7 @@ const settings={shiftingFee:50, overtime:{active:true,start:'17:00',end:'06:00',
 test('size-specific handling rate wins over all-size rate',()=>{assert.equal(pickApplicableRates(rates,booking).find(r=>r.name==='Gate-in Handling').amount,200)});
 test('shifting once plus VAT excludes exempt fees',()=>{
  const quote=priceLines(rates.filter(r=>r.collectionPoint==='GATE_IN'),booking,'GATE_IN',settings);
- assert.equal(quote.subtotal,250);assert.equal(quote.vat,30);assert.equal(quote.total,280);
+ assert.equal(quote.subtotal,250);assert.equal(quote.vat,26.79);assert.equal(quote.total,250);
  assert.equal(quote.lines.filter(l=>l.description==='Shifting Fee').length,1);
 });
 test('tax-inclusive VAT extraction and storage day rounding',()=>{

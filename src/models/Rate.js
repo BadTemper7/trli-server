@@ -21,7 +21,11 @@ const schema = new mongoose.Schema({
   taxTreatment:{type:String,enum:['TAXABLE','EXEMPT','ZERO_RATED'],default:'TAXABLE'},
   loadStatus: { type: String, enum: ['EMPTY', 'LOADED', 'ALL'], required: true, index: true },
   containerSize: { type: String, enum: ['ALL', '20FT', '40FT'], default: 'ALL', index: true },
-  amount: { type: Number, required: true, min: 0.01 },
+  amount: { type: Number, required: true, min: 0 },
+  pricingMode: { type:String, enum:['FIXED','MANUAL'], default:'FIXED' },
+  allocationMode: { type:String, enum:['PERCENTAGE','FIXED'], default:'PERCENTAGE' },
+  gateInAllocation: { type:Number, default:50, min:0 },
+  gateOutAllocation: { type:Number, default:50, min:0 },
   billingMode: {type:String,enum:['AUTOMATIC','OPTIONAL'],default:'AUTOMATIC'},
   collectionPoint: { type: String, enum: ['GATE_IN', 'GATE_OUT', 'BOTH'], required: true, index: true },
   status: { type: String, enum: ['ACTIVE', 'INACTIVE'], default: 'ACTIVE', index: true },
@@ -32,8 +36,15 @@ const schema = new mongoose.Schema({
 }, { timestamps: true });
 
 schema.pre('validate', function(next) {
-  if (this.name !== 'Overtime' && (this.classification === 'ALL' || this.loadStatus === 'ALL' || this.containerCategory === 'ALL' || this.collectionPoint === 'BOTH')) {
-    return next(new Error('Universal rate scopes and Both collection points are reserved for Overtime.'));
+  if (this.name !== 'Overtime' && (this.classification === 'ALL' || this.loadStatus === 'ALL' || this.containerCategory === 'ALL')) {
+    return next(new Error('Universal rate scopes are reserved for Overtime.'));
+  }
+  if (this.pricingMode === 'FIXED' && !(this.amount > 0)) return next(new Error('Fixed rates require a positive amount.'));
+  if (this.collectionPoint === 'BOTH') {
+    const sum = Number(this.gateInAllocation) + Number(this.gateOutAllocation);
+    const target = this.allocationMode === 'FIXED' ? Number(this.amount) : 100;
+    if (!Number.isFinite(sum) || Math.abs(Math.round(sum*100)-Math.round(target*100))>0 || this.gateInAllocation<0 || this.gateOutAllocation<0) return next(new Error('Both-stage allocations must add up to 100% or the configured fixed rate.'));
+    if(this.allocationMode==='FIXED' && this.pricingMode==='MANUAL') return next(new Error('Manual rates must use percentage allocations.'));
   }
   if (this.containerCategory === 'REEFER' && this.loadStatus === 'LOADED') return next(new Error('Loaded reefer rate is not supported.'));
   next();

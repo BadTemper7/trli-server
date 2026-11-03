@@ -216,7 +216,7 @@ function invoiceTotals(page,invoice,lines,showTotals) {
   for(const line of lines){sums[line.taxTreatment||'TAXABLE']=(sums[line.taxTreatment||'TAXABLE']||0)+Number(line.amount||0);}
   const taxRate=Number(invoice.vatRate||0);
   const taxableBase=invoice.vatInclusive && taxRate? sums.TAXABLE/(1+taxRate/100):sums.TAXABLE;
-  const info=[['VATable Sales',taxableBase],['VAT-Exempt Sales',sums.EXEMPT],['Zero-Rated Sales',sums.ZERO_RATED]];
+  const info=[['VATable Sales',taxableBase],['Non-VATable Sales',sums.EXEMPT+sums.ZERO_RATED],['Zero-Rated Sales',sums.ZERO_RATED]];
   info.forEach(([label,value],i)=>{
     page.rect(29,578+i*22,234,22,C.white,C.line);
     page.text(36,584+i*22,label,8,{color:C.green,bold:true});

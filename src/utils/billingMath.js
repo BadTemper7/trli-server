@@ -3,15 +3,11 @@ import { requireGateOutAfterGateIn, storageDaysBetween } from './storageDuration
 /** All currency amounts are server-computed and rounded to PHP centavos. */
 export const money = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 
-// Fixed/automatic service rates cannot be silently switched to manual billing.
-export const AUTOMATIC_RATE_NAMES = Object.freeze([
-  'Gate-in Handling', 'Gate-out Handling', 'Lift On', 'Lift Off', 'Storage', 'Shifting Fee', 'Overtime',
-]);
-export const OPTIONAL_RATE_NAMES = Object.freeze(['Documentation Fee', 'Congestion Surcharge', 'Other']);
-export const ALWAYS_OPTIONAL_RATE_NAMES = Object.freeze(['Documentation Fee', 'Other']);
-export const rateBillingMode = (rate) => AUTOMATIC_RATE_NAMES.includes(rate.name)
-  ? 'AUTOMATIC'
-  : (ALWAYS_OPTIONAL_RATE_NAMES.includes(rate.name) ? 'OPTIONAL' : (rate.billingMode === 'AUTOMATIC' ? 'AUTOMATIC' : 'OPTIONAL'));
+// Rate application (automatic vs optional) is configurable for every service.
+export const AUTOMATIC_RATE_NAMES = Object.freeze(['Gate-in Handling','Gate-out Handling','Lift On','Lift Off','Storage','Shifting Fee','Overtime']);
+export const OPTIONAL_RATE_NAMES = Object.freeze(['Documentation Fee','Congestion Surcharge','Other']);
+export const ALWAYS_OPTIONAL_RATE_NAMES = Object.freeze([]);
+export const rateBillingMode = rate => rate.billingMode === 'OPTIONAL' ? 'OPTIONAL' : (rate.billingMode === 'AUTOMATIC' ? 'AUTOMATIC' : (OPTIONAL_RATE_NAMES.includes(rate.name) ? 'OPTIONAL' : 'AUTOMATIC'));
 
 export function overtimeApplies(time, settings = {}) {
   if (settings.active === false || !time) return false;
@@ -30,11 +26,7 @@ export function billableStorageDays(actualGateInAt, scheduledDate, scheduledTime
 }
 
 export function allowedRatesForCollection(rates, type) {
-  const gateInOnly=new Set(['Gate-in Handling','Shifting Fee','Documentation Fee']);
-  const gateOutOnly=new Set(['Gate-out Handling','Storage']);
-  return rates.filter(r => (!r.collectionPoint || r.collectionPoint===type || (r.name === 'Overtime' && r.collectionPoint === 'BOTH'))
-    && !(type==='GATE_IN'&&gateOutOnly.has(r.name))
-    && !(type==='GATE_OUT'&&gateInOnly.has(r.name)));
+  return rates.filter(rate=>rate.collectionPoint===type || rate.collectionPoint==='BOTH' || !rate.collectionPoint);
 }
 
 /**
@@ -54,13 +46,14 @@ export function pickApplicableRates(rates, booking, collectionPoint = null) {
         && (!r.containerCategory || r.containerCategory === 'ALL' || r.containerCategory === category)
         && (!r.containerSize || r.containerSize === 'ALL' || r.containerSize === booking.containerSize);
     }
-    return r.classification === booking.transactionClassification
+    return (!collectionPoint || r.collectionPoint === collectionPoint || r.collectionPoint === 'BOTH')
+      && r.classification === booking.transactionClassification
       && r.loadStatus === booking.loadStatus
       && ['ALL', booking.containerSize].includes(r.containerSize || 'ALL')
       && (!r.containerCategory || r.containerCategory === category);
   });
   const chosen = new Map();
-  const normalScore = r => (r.containerSize === booking.containerSize ? 2 : 0) + (r.containerCategory === category ? 1 : 0);
+  const normalScore = r => (r.containerSize === booking.containerSize ? 20 : 0) + (r.containerCategory === category ? 10 : 0) + (collectionPoint && r.collectionPoint===collectionPoint ? 1 : 0);
   const overtimeScore = r => {
     const specifics = [r.classification === booking.transactionClassification, r.containerCategory === category, r.loadStatus === booking.loadStatus, r.containerSize === booking.containerSize];
     const specificity = specifics.filter(Boolean).length;
@@ -81,7 +74,7 @@ export function pickApplicableRates(rates, booking, collectionPoint = null) {
 export function getOptionalRateChoices(rates, booking, type = null) {
   return pickApplicableRates(type?allowedRatesForCollection(rates,type):rates, booking, type)
     .filter(r => rateBillingMode(r) === 'OPTIONAL')
-    .map(r => ({ id: String(r._id), name: r.name, description: r.description || '', amount: money(r.amount), taxTreatment: r.taxTreatment || 'TAXABLE' }));
+    .map(r => ({ id: String(r._id), name: r.name, description: r.description || '', amount: r.pricingMode==='MANUAL'?(booking.manualRateAmounts?.get?.(String(r._id))??booking.manualRateAmounts?.[String(r._id)]??null):money(r.amount), pricingMode:r.pricingMode||'FIXED', collectionPoint:r.collectionPoint, taxTreatment: r.taxTreatment || 'TAXABLE' }));
 }
 
 /**
@@ -96,7 +89,7 @@ export function gateOutTransactionPreview(rates, booking, settings = {}) {
     id: String(rate._id),
     name: rate.name === 'Other' && rate.description ? rate.description : rate.name,
     description: rate.description || '',
-    amount: money(rate.amount),
+    amount: money(rate.amount), pricingMode:rate.pricingMode||'FIXED', collectionPoint:rate.collectionPoint,
     taxTreatment: rate.taxTreatment || 'TAXABLE',
     basis: rate.name === 'Storage' ? 'PER_CALENDAR_DAY' : rate.name === 'Overtime' ? 'CONDITIONAL_OVERTIME' : 'PER_TRANSACTION',
     isOptional: rateBillingMode(rate) === 'OPTIONAL',
@@ -123,24 +116,59 @@ export function parseOptionalRateIds(value) {
   return ids;
 }
 
-export function optionalPriceLines(rates, booking, selectedRateIds, type = null) {
-  const ids = parseOptionalRateIds(selectedRateIds);
-  const applicable = pickApplicableRates(type?allowedRatesForCollection(rates,type):rates, booking, type).filter(rate => rateBillingMode(rate) === 'OPTIONAL');
-  const chosen = applicable.filter(rate => ids.includes(String(rate._id)));
-  if (chosen.length !== ids.length) throw new Error('Selected optional charge is not active or does not apply to this container.');
-  return chosen.map(rate => ({
-    description: rate.name === 'Other' && rate.description ? rate.description : rate.name,
-    quantity: 1, unitRate: money(rate.amount), amount: money(rate.amount),
-    taxTreatment: rate.taxTreatment || 'TAXABLE', rateId: String(rate._id), isOptional: true,
-  }));
+/** Resolve a transaction-only manual amount. Never accept a client-supplied rate override. */
+export function resolveRateAmount(rate, manualAmounts = {}) {
+  if (rate.pricingMode !== 'MANUAL') return money(rate.amount);
+  const value = manualAmounts?.[String(rate._id)] ?? manualAmounts?.get?.(String(rate._id));
+  if (value === undefined || value === null || value === '') throw new Error(`Manual price is required for ${rate.name}; ask an authorized administrator to set it before billing.`);
+  const amount=Number(value);
+  if (!Number.isFinite(amount) || amount<=0 || Math.abs(amount*100-Math.round(amount*100))>0.0001) throw new Error(`Invalid manual price for ${rate.name}.`);
+  return money(amount);
 }
 
-export function totalsForLines(lines, vatRate = 12, vatInclusive = false) {
+export function stageCharge(rate, fullAmount, type, previousAmount = null) {
+  const total=money(fullAmount);
+  if(rate.collectionPoint!=='BOTH')return total;
+  const mode=rate.allocationMode||'PERCENTAGE';
+  const first=mode==='FIXED'
+    ? money(Number(rate.gateInAllocation??Number(rate.amount)/2)* (Number(rate.amount)>0 ? total/Number(rate.amount) : 1))
+    : money(total*Number(rate.gateInAllocation??50)/100);
+  if(type==='GATE_IN')return first;
+  // A previously collected gate-in portion is authoritative even if actual Storage days change.
+  // A service selected only at Gate-out collects 100% here, never drops the first portion.
+  return money(Math.max(0,total-(previousAmount===null?0:Number(previousAmount))));
+}
+
+export function optionalPriceLines(rates, booking, selectedRateIds, type = null, options={}) {
+  const ids = parseOptionalRateIds(selectedRateIds);
+  const applicable = pickApplicableRates(type?allowedRatesForCollection(rates,type):rates, booking, type).filter(rate => rateBillingMode(rate) === 'OPTIONAL');
+  const prior = options.previousInvoice?.lines || [];
+  const carried = type === 'GATE_OUT' ? prior.filter(line=>line.isOptional && line.collectionPoint==='BOTH').map(line=>String(line.rateId)) : [];
+  const chosen = applicable.filter(rate => ids.includes(String(rate._id)) || carried.includes(String(rate._id)));
+  if (chosen.length !== new Set([...ids,...carried.filter(id=>applicable.some(r=>String(r._id)===id))]).size) throw new Error('Selected optional charge is not active or does not apply to this container.');
+  return chosen.map(rate => makeRateLine(rate,booking,type,options,true));
+}
+
+function makeRateLine(rate,booking,type,options,isOptional=false) {
+  const quantity = rate.name==='Storage' && type==='GATE_OUT' ? Number(options.days||1) : 1;
+  const earlier=(options.previousInvoice?.lines||[]).find(line=>String(line.rateId)===String(rate._id));
+  const unitRate=earlier?.pricingMode==='MANUAL' && rate.pricingMode==='MANUAL' && earlier?.fullAmount
+    ? money(earlier.fullAmount/Number(earlier.quantity||1)) : resolveRateAmount(rate,options.manualAmounts);
+  const fullAmount=money(quantity*unitRate);
+  const amount=stageCharge(rate,fullAmount,type,earlier?.amount??null);
+  return {description:rate.name==='Other'&&rate.description?rate.description:rate.name,quantity,unitRate,fullAmount,amount,
+    taxTreatment:rate.taxTreatment||'TAXABLE',rateId:String(rate._id),isOptional,
+    pricingMode:rate.pricingMode||'FIXED',collectionPoint:rate.collectionPoint};
+}
+
+export function totalsForLines(lines, vatRate = 12, vatInclusive = true) {
   if (!Number.isFinite(Number(vatRate)) || Number(vatRate) < 0 || Number(vatRate) > 100) throw new Error('Invalid VAT settings.');
-  const subtotal = money(lines.reduce((n, line) => n + Number(line.amount || 0), 0));
-  const taxableSubtotal = money(lines.filter(line => line.taxTreatment === 'TAXABLE').reduce((n, line) => n + Number(line.amount || 0), 0));
-  const vat = money(vatInclusive ? taxableSubtotal * vatRate / (100 + Number(vatRate)) : taxableSubtotal * vatRate / 100);
-  return { lines, subtotal, vat, total: money(subtotal + (vatInclusive ? 0 : vat)), taxableSubtotal, vatRate: Number(vatRate), vatInclusive: Boolean(vatInclusive) };
+  const taxableSubtotal=money(lines.filter(line => (line.taxTreatment||'TAXABLE')==='TAXABLE').reduce((n,line)=>n+Number(line.amount||0),0));
+  const nonVatableSales=money(lines.filter(line => (line.taxTreatment||'TAXABLE')!=='TAXABLE').reduce((n,line)=>n+Number(line.amount||0),0));
+  const subtotal=money(taxableSubtotal+nonVatableSales);
+  const vat=money(vatInclusive ? taxableSubtotal*Number(vatRate)/(100+Number(vatRate)) : taxableSubtotal*Number(vatRate)/100);
+  const vatableSales=money(taxableSubtotal-(vatInclusive?vat:0));
+  return {lines,subtotal,vat,total:money(subtotal+(vatInclusive?0:vat)),taxableSubtotal,vatableSales,nonVatableSales,vatRate:Number(vatRate),vatInclusive:Boolean(vatInclusive)};
 }
 
 /**
@@ -148,33 +176,31 @@ export function totalsForLines(lines, vatRate = 12, vatInclusive = false) {
  * to the actual physical time requires a separately reviewed adjustment, NEVER
  * an undisclosed mutation of a previously verified/paid invoice.
  */
-export function priceLines(rates, booking, type, settings, now = new Date(), optionalRateIds = []) {
-  if (!['GATE_IN', 'GATE_OUT'].includes(type)) throw new Error('Invalid billing collection point.');
-  const days = type === 'GATE_OUT'
-    ? billableStorageDays(booking.gateIn?.actualGateInAt, booking.gateOut?.scheduledDate, booking.gateOut?.scheduledTime, now, 'CALENDAR_DAYS')
-    : 1;
-  const applicable = pickApplicableRates(allowedRatesForCollection(rates,type), booking, type);
-  const lines = applicable.filter(r => !['Overtime', 'Shifting Fee'].includes(r.name) && rateBillingMode(r) === 'AUTOMATIC')
-    .map(r => {
-      const quantity = r.name === 'Storage' ? days : 1;
-      return { description: r.name, quantity, unitRate: money(r.amount), amount: money(quantity * r.amount), taxTreatment: r.taxTreatment || 'TAXABLE', rateId: String(r._id), isOptional: false };
-    });
-  lines.push(...optionalPriceLines(rates, booking, optionalRateIds, type));
-
-  if (type === 'GATE_IN') {
-    // One shifting charge: size-specific rate wins, legacy Settings amount is fallback only.
-    const shifting = applicable.find(r => r.name === 'Shifting Fee');
-    const fee = Number(shifting ? shifting.amount : (settings.shiftingFee || 0));
-    if (fee > 0) lines.push({ description: 'Shifting Fee', quantity: 1, unitRate: money(fee), amount: money(fee), taxTreatment: shifting?.taxTreatment || 'TAXABLE', rateId: shifting ? String(shifting._id) : undefined, isOptional: false });
+export function priceLines(rates, booking, type, settings, now = new Date(), optionalRateIds = [], options={}) {
+  if (!['GATE_IN','GATE_OUT'].includes(type)) throw new Error('Invalid billing collection point.');
+  const days=type==='GATE_OUT'
+    ? billableStorageDays(booking.gateIn?.actualGateInAt,booking.gateOut?.scheduledDate,booking.gateOut?.scheduledTime,now,'CALENDAR_DAYS') : 1;
+  const applicable=pickApplicableRates(allowedRatesForCollection(rates,type),booking,type);
+  const context={...options,days,manualAmounts:options.manualAmounts||booking.manualRateAmounts||{}};
+  const lines=applicable.filter(r=>!['Overtime','Shifting Fee'].includes(r.name)&&rateBillingMode(r)==='AUTOMATIC')
+    .map(r=>makeRateLine(r,booking,type,context));
+  lines.push(...optionalPriceLines(rates,booking,optionalRateIds,type,context));
+  const shifting=applicable.find(r=>r.name==='Shifting Fee');
+  // Settings fallback is Gate-in only. An explicit Rate Setup row follows its own collection stage.
+  if(shifting && rateBillingMode(shifting)==='AUTOMATIC') lines.push(makeRateLine(shifting,booking,type,context));
+  else if(type==='GATE_IN'&&!shifting&&Number(settings.shiftingFee||0)>0) {
+    const fee=money(settings.shiftingFee);
+    lines.push({description:'Shifting Fee',quantity:1,unitRate:fee,fullAmount:fee,amount:fee,taxTreatment:'TAXABLE',isOptional:false,collectionPoint:'GATE_IN'});
   }
-
-  const time = type === 'GATE_IN' ? booking.scheduledGateTimeIn : booking.gateOut?.scheduledTime;
-  if (overtimeApplies(time, settings.overtime || { active: true, start: '18:00', end: '08:00' })) {
-    // A service-specific Rate Setup amount overrides the generic Settings fallback.
-    const overtime = applicable.find(r => r.name === 'Overtime');
-    const fee = Number(overtime ? overtime.amount : (settings.overtime?.fee || 0));
-    if (fee > 0) lines.push({ description: 'Overtime', quantity: 1, unitRate: money(fee), amount: money(fee), taxTreatment: overtime?.taxTreatment || 'TAXABLE', rateId: overtime ? String(overtime._id) : undefined, isOptional: false });
+  const time=type==='GATE_IN'?booking.scheduledGateTimeIn:booking.gateOut?.scheduledTime;
+  if(overtimeApplies(time,settings.overtime||{active:true,start:'18:00',end:'08:00'})){
+    const overtime=applicable.find(r=>r.name==='Overtime');
+    if(overtime&&rateBillingMode(overtime)==='AUTOMATIC')lines.push(makeRateLine(overtime,booking,type,context));
+    else if(!overtime&&Number(settings.overtime?.fee||0)>0){
+      const fee=money(settings.overtime.fee);
+      lines.push({description:'Overtime',quantity:1,unitRate:fee,fullAmount:fee,amount:fee,taxTreatment:'TAXABLE',isOptional:false,collectionPoint:type});
+    }
   }
-
-  return totalsForLines(lines, Number(settings.tax?.vatRate ?? 12), Boolean(settings.tax?.vatInclusive));
+  // New invoices are always VAT-inclusive regardless of historical SiteSettings.vatInclusive.
+  return totalsForLines(lines.filter(line=>line.amount>0),Number(settings.tax?.vatRate??12),true);
 }

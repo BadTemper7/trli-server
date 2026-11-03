@@ -20,8 +20,8 @@ test('universal BOTH overtime applies once for local and international, standard
   for(const gate of ['GATE_IN','GATE_OUT']) {
     const result=priceLines([row('a')],booking,gate,settings);
     assert.equal(amount(result).length,1,`${gate} ${JSON.stringify(config)}`);
-    assert.equal(amount(result)[0].amount,275);
-    assert.equal(result.vat,33);
+    assert.equal(amount(result)[0].amount,gate==='GATE_IN'?137.5:275);
+    assert.equal(result.vat,gate==='GATE_IN'?14.73:29.46);
   }
  }
  assert.equal(configurations.length,12);
@@ -33,17 +33,17 @@ test('one more specific override for International Reefer Empty overrides univer
  for(const type of ['GATE_IN','GATE_OUT']){
   const quote=priceLines(rates,reefer,type,settings);
   assert.equal(amount(quote).length,1);
-  assert.equal(amount(quote)[0].amount,480);
+  assert.equal(amount(quote)[0].amount,type==='GATE_IN'?240:480);
  }
- assert.equal(amount(priceLines(rates,{...reefer,containerType:'DRY CONTAINER'},'GATE_IN',settings))[0].amount,275);
+ assert.equal(amount(priceLines(rates,{...reefer,containerType:'DRY CONTAINER'},'GATE_IN',settings))[0].amount,137.5);
 });
 
 test('equal-dimension gate-specific override beats BOTH; more specific BOTH still beats broad gate override',()=>{
  const rates=[row('a'),row('b',{collectionPoint:'GATE_OUT',amount:320})];
- assert.equal(amount(priceLines(rates,baseBooking,'GATE_IN',settings))[0].amount,275);
+ assert.equal(amount(priceLines(rates,baseBooking,'GATE_IN',settings))[0].amount,137.5);
  assert.equal(amount(priceLines(rates,baseBooking,'GATE_OUT',settings))[0].amount,320);
  const moreSpecific=[...rates,row('c',{collectionPoint:'BOTH',containerSize:'20FT',amount:390})];
- assert.equal(amount(priceLines(moreSpecific,baseBooking,'GATE_IN',settings))[0].amount,390);
+ assert.equal(amount(priceLines(moreSpecific,baseBooking,'GATE_IN',settings))[0].amount,195);
  assert.equal(amount(priceLines(moreSpecific,baseBooking,'GATE_OUT',settings))[0].amount,390);
 });
 
@@ -77,9 +77,9 @@ test('Gate-out transaction preview shows one selected OT and fallback with no ex
  assert.equal(fallback.hasBaseCharge,false);
 });
 
-test('gate-specific universal rate does not leak into opposite gate; non-OT BOTH is excluded',()=>{
+test('gate-specific universal rate does not leak into opposite gate; non-OT BOTH supports allocation',()=>{
  const ghost={...row('a'),name:'Lift Off'};
- assert.equal(allowedRatesForCollection([ghost], 'GATE_IN').length,0);
+ assert.equal(allowedRatesForCollection([ghost], 'GATE_IN').length,1);
  const onlyIn=row('b',{collectionPoint:'GATE_IN'});
  assert.equal(pickApplicableRates(allowedRatesForCollection([onlyIn], 'GATE_OUT'), baseBooking, 'GATE_OUT').length,0);
 });
@@ -93,7 +93,7 @@ test('Rate model, rate-validation and admin UI support wildcard OT but keep othe
  for(const value of ["'ALL'","'BOTH'"])assert.ok(model.includes(value));
  assert.match(controller,/name !== 'Overtime'/);
  assert.match(model,/reserved for Overtime/);
- assert.match(form,/Gate-in &amp; Gate-out \(both\)/);
+ assert.match(form,/value="BOTH"/);
  assert.match(form,/All classifications/);
  assert.match(form,/All load statuses/);
  assert.match(service,/collectionPoint:\{\$in:\[type,'BOTH'\]\}/);

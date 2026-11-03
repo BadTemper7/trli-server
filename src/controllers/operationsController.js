@@ -269,7 +269,10 @@ export const approvePreAdvice = asyncHandler(async (req, res) => {
       invoice=await Invoice.findOne({booking:booking._id,type:'GATE_IN'}).session(session);
       if(!invoice){
         const quote=await calculateInvoice(booking,'GATE_IN');
-        invoice=(await Invoice.create([{...quote,number:await nextReference('INVOICE',new Date(),session),booking:booking._id,company:booking.company,type:'GATE_IN',status:quote.total===0?'PAID':'UNPAID'}],{session}))[0];
+        const {rateSnapshots,billingSettingsSnapshot,...invoiceQuote}=quote;
+        invoice=(await Invoice.create([{...invoiceQuote,number:await nextReference('INVOICE',new Date(),session),booking:booking._id,company:booking.company,type:'GATE_IN',status:quote.total===0?'PAID':'UNPAID'}],{session}))[0];
+        if(rateSnapshots)booking.rateSnapshots=rateSnapshots;
+        if(billingSettingsSnapshot)booking.billingSettingsSnapshot=billingSettingsSnapshot;
       }
       booking.gateIn.payment.amountDue=invoice.total;
       await booking.save({session});

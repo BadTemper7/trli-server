@@ -16,7 +16,7 @@ function dto(settings) {
     operatingHours: settings?.operatingHours || '24 hours daily',
     schedule:settings?.schedule || DEFAULT_OPERATING_SCHEDULE,
     overtime:settings?.overtime || {start:'18:00',end:'08:00',fee:0,active:true},
-    tax:settings?.tax || {vatRate:12,vatInclusive:false},
+    tax:{vatRate:Number(settings?.tax?.vatRate??12),vatInclusive:true},
     shiftingFee:Number(settings?.shiftingFee||0),
     storageBilling:{rounding:'CALENDAR_DAYS'},
     updatedAt: settings?.updatedAt || null,
@@ -54,7 +54,7 @@ export const updateCompanySettings = asyncHandler(async (req, res) => {
   const overtime=req.body?.overtime;
   if(overtime && (!HH.test(overtime.start)||!HH.test(overtime.end)||overtime.start===overtime.end||!Number.isFinite(Number(overtime.fee))||Number(overtime.fee)<0||typeof overtime.active!=='boolean'))throw new AppError('Invalid overtime configuration.',400);
   const tax=req.body?.tax;
-  if(tax && (!Number.isFinite(Number(tax.vatRate))||Number(tax.vatRate)<0||Number(tax.vatRate)>100||typeof tax.vatInclusive!=='boolean'))throw new AppError('Invalid VAT configuration.',400);
+  if(tax && (!Number.isFinite(Number(tax.vatRate))||Number(tax.vatRate)<0||Number(tax.vatRate)>100||(tax.vatInclusive!==undefined && tax.vatInclusive!==true)))throw new AppError('Invalid VAT configuration.',400);
   if(req.body?.shiftingFee!==undefined&&(!Number.isFinite(Number(req.body.shiftingFee))||Number(req.body.shiftingFee)<0))throw new AppError('Invalid shifting fee.',400);
   const billing=req.body?.storageBilling;
   if(billing&&billing.rounding!=='CALENDAR_DAYS')throw new AppError('Unsupported storage billing-day rule.',400);
@@ -68,7 +68,7 @@ export const updateCompanySettings = asyncHandler(async (req, res) => {
         operatingHours: schedule && is24HourSchedule(schedule) && schedule.operatingDays.length===7 ? '24 hours daily' : operatingHours,
         ...(schedule?{schedule}:{}),
         ...(req.body?.overtime?{overtime:req.body.overtime}:{}),
-        ...(req.body?.tax?{tax:req.body.tax}:{}),
+        ...(req.body?.tax?{tax:{vatRate:Number(req.body.tax.vatRate),vatInclusive:true}}:{}),
         ...(req.body?.shiftingFee!==undefined?{shiftingFee:Number(req.body.shiftingFee)}:{}),
         ...(billing?{storageBilling:billing}:{}),
         updatedBy: req.admin._id,

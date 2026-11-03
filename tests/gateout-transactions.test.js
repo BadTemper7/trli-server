@@ -38,8 +38,8 @@ test('Quote still computes full calendar-day storage, automatic services, OT and
   assert.equal(q.lines.find(l=>l.description==='Overtime').amount,250);
   assert.equal(q.lines.some(l=>l.description==='Sweeping'),false);
   assert.equal(q.subtotal,2650);
-  assert.equal(q.vat,318);
-  assert.equal(q.total,2968);
+  assert.equal(q.vat,283.93);
+  assert.equal(q.total,2650);
 });
 test('Client Gate-out transaction route requires client auth and checks company ownership',()=>{
   const routes=readFileSync(new URL('../src/routes/clientGateOutRoutes.js',import.meta.url),'utf8');

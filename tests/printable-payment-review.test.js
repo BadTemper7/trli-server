@@ -34,7 +34,7 @@ test('Gate-out pass stays explicitly DRAFT until final gate-out approval',()=>{
 test('Service Invoice uses independent invoice reference and tax rows',()=>{
   const pdf=renderServiceInvoicePdf({invoice,booking,companyName:'Sample Company'});
   for(const label of ['SERVICE','INVOICE','TRANS-INV-20261103-0001','TRANS-BKG-20261103-0001',
-    'Documentation Fee','Shifting Fee','VATable Sales','VAT-Exempt Sales','312.00'])assert.ok(text(pdf).includes(label),label);
+    'Documentation Fee','Shifting Fee','VATable Sales','Non-VATable Sales','312.00'])assert.ok(text(pdf).includes(label),label);
 });
 test('Large invoices paginate and retain totals on the final page',()=>{
   const many={...invoice,lines:Array.from({length:26},(_,i)=>({description:`Service ${i+1}`,quantity:1,unitRate:10,amount:10,taxTreatment:'TAXABLE'}))};

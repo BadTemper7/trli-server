@@ -27,6 +27,6 @@ test('Rate Setup supports Gate-in Documentation and Shifting and settings defaul
  const settings=read('../src/models/SiteSettings.js');
  const rateController=read('../src/controllers/rateController.js');
  for(const fee of ['Documentation Fee','Shifting Fee','Overtime']) assert.ok(rateForm.includes(`'${fee}'`));
- assert.match(rateController,/Documentation Fee','Shifting Fee','Gate-in Handling/);
+ assert.match(rateController,/collectionPoint: new Set.*BOTH/);
  assert.match(settings,/default:'18:00'/);
 });

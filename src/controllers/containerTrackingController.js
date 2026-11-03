@@ -194,6 +194,6 @@ export const printPass=asyncHandler(async(req,res)=>{
   if(!authorized)throw new AppError('This pass is unavailable until the applicable approval is recorded.',403);
   const booking=source==='live'?doc:{...doc,gateIn:{...doc.gateIn,inspection:doc.gateIn?.inspection||{status:'ACCEPTED'}},gateOut:{...doc.gateOut,approvalStatus:doc.approvals?.gateOut?'APPROVED':'NONE'}};
   const data=renderGatePassPdf({booking,type});
-  res.type('application/pdf').set('Cache-Control','private,no-store').set('Content-Disposition',`attachment; filename="${String(doc.containerNumber).replace(/[^A-Z0-9-]/ig,'')}-${type.toLowerCase()}-pass.pdf"`).send(data);
+  res.type('application/pdf').set('Cache-Control','private,no-store').set('Content-Disposition',`${req.query.download==='1'?'attachment':'inline'}; filename="${String(doc.containerNumber).replace(/[^A-Z0-9-]/ig,'')}-${type.toLowerCase()}-pass.pdf"`).send(data);
 });
 export const clientPass=(req,res,next)=>{req.companyId=req.user.company._id;return printPass(req,res,next);};

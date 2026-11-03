@@ -26,14 +26,14 @@ test('Documentation Fee is optional and not silently added to Gate-in',()=>{
  assert.equal(q.lines.find(r=>r.description==='Shifting Fee').amount,250); // rate overrides legacy Settings 120
  assert.equal(q.lines.find(r=>r.description==='Overtime').amount,400); // Rate overrides Settings 300
  assert.equal(q.subtotal,1500); // handling 800 + lift on 50 + shifting 250 + OT 400
- assert.equal(q.vat,180);
- assert.equal(q.total,1680);
+ assert.equal(q.vat,160.71);
+ assert.equal(q.total,1500);
 });
 test('Manual optional Documentation Fee changes total and VAT exactly once',()=>{
  const q=priceLines(rates.filter(r=>r.collectionPoint==='GATE_IN'),booking,'GATE_IN',settings,new Date(),[id('c')]);
  assert.equal(q.lines.filter(r=>r.description==='Documentation Fee').length,1);
  assert.equal(q.lines.find(r=>r.description==='Documentation Fee').amount,150);
- assert.equal(q.subtotal,1650);assert.equal(q.vat,198);assert.equal(q.total,1848);
+ assert.equal(q.subtotal,1650);assert.equal(q.vat,176.79);assert.equal(q.total,1650);
  assert.equal(q.lines.find(r=>r.description==='Documentation Fee').isOptional,true);
 });
 test('Gate-out includes fixed Storage and Lift Off; not Gate-in shifting or documentation',()=>{
@@ -44,18 +44,18 @@ test('Gate-out includes fixed Storage and Lift Off; not Gate-in shifting or docu
  assert.equal(q.lines.find(r=>r.description==='Overtime').amount,350);
  assert.equal(q.subtotal,1220); // 500+300+70+350
 });
-test('A legacy documentation rate accidentally configured at Gate-out is never billable there',()=>{
+test('Admin may configure Documentation Fee for optional Gate-out billing',()=>{
  const mistaken=rate('7','Documentation Fee',199,'GATE_OUT','OPTIONAL');
  const available=[...rates.filter(r=>r.collectionPoint==='GATE_OUT'),mistaken];
- assert.equal(getOptionalRateChoices(available,booking,'GATE_OUT').some(c=>c.name==='Documentation Fee'),false);
- assert.throws(()=>priceLines(available,booking,'GATE_OUT',settings,new Date(),[id('7')]),/not active or does not apply/);
+ assert.equal(getOptionalRateChoices(available,booking,'GATE_OUT').some(c=>c.name==='Documentation Fee'),true);
+ assert.equal(priceLines(available,booking,'GATE_OUT',settings,new Date(),[id('7')]).lines.find(c=>c.description==='Documentation Fee').amount,199);
 });
 test('Other service may be selected manually at Gate-out with its server rate',()=>{
  const gateRates=rates.filter(r=>r.collectionPoint==='GATE_OUT');
  assert.equal(getOptionalRateChoices(gateRates,booking).length,1);
  const q=priceLines(gateRates,booking,'GATE_OUT',settings,new Date(),[id('4')]);
  assert.equal(q.lines.find(r=>r.description==='Container sweeping').amount,85);
- assert.equal(q.total,1461.60); // (1220+85)*1.12
+ assert.equal(q.total,1305); // VAT is included, not added
 });
 test('Optional fee selection rejects inapplicable, cross-point, or repeated IDs',()=>{
  assert.throws(()=>priceLines(rates.filter(r=>r.collectionPoint==='GATE_OUT'),booking,'GATE_OUT',settings,new Date(),[id('c')]),/not active or does not apply/);

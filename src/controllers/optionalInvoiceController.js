@@ -26,7 +26,7 @@ export const updateInvoiceOptionalCharges = asyncHandler(async(req,res)=>{
       if(!updated)throw new AppError('Optional charges can only be edited before Gate-in payment is submitted.',409);
       booking=await PreAdvice.findById(updated.booking).session(session);
       if(!booking||!['READY_FOR_GATE_IN','GATE_IN_PAYMENT_SUBMITTED'].includes(booking.workflowStage))throw new AppError('Booking is no longer eligible for billing changes.',409);
-      await updateUnpaidInvoiceOptionalCharges(updated,booking,req.body?.rateIds,session);
+      await updateUnpaidInvoiceOptionalCharges(updated,booking,req.body?.rateIds,session,req.body?.manualAmounts||{});
       await updated.save({session});
       booking.gateIn.payment.amountDue=updated.total;
       await booking.save({session});

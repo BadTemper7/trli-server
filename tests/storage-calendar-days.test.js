@@ -49,6 +49,6 @@ test('Gate-out storage invoice uses two days and correctly calculates 12% VAT',(
   const invoice=priceLines(rates,booking,'GATE_OUT',{storageBilling:{rounding:'CALENDAR_DAYS'},tax:{vatRate:12,vatInclusive:false},overtime:{active:false}});
   assert.equal(invoice.lines.find(l=>l.description==='Storage').quantity,2);
   assert.equal(invoice.subtotal,1600);
-  assert.equal(invoice.vat,192);
-  assert.equal(invoice.total,1792);
+  assert.equal(invoice.vat,171.43);
+  assert.equal(invoice.total,1600);
 });

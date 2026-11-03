@@ -1,4 +1,5 @@
 import PreAdvice from '../models/PreAdvice.js';
+import Invoice from '../models/Invoice.js';
 import mongoose from 'mongoose';
 import { getIO, emitToAdminModule } from '../socket/index.js';
 import { MODULES } from '../constants/permissions.js';
@@ -58,6 +59,13 @@ export const list = asyncHandler(async (req, res) => {
   const filter = { company: req.user.company._id };
   const status = String(req.query.status || '').trim().toUpperCase();
   if (['DRAFT', 'SUBMITTED', 'REJECTED', 'SCHEDULED', 'READY_FOR_GATE_IN', 'GATED_IN', 'COMPLETED', 'CANCELLED'].includes(status)) filter.status = status;
+  const category=String(req.query.category||'ALL').toUpperCase();
+  if(!['ALL','GATE_IN_PAYMENT','REQUESTABLE_GATE_OUT','GATE_OUT_PAYMENT'].includes(category))throw new AppError('Invalid booking filter.',400);
+  if(category==='GATE_IN_PAYMENT'||category==='GATE_OUT_PAYMENT'){
+    filter._id={$in:await Invoice.distinct('booking',{company:req.user.company._id,type:category==='GATE_IN_PAYMENT'?'GATE_IN':'GATE_OUT'})};
+  }else if(category==='REQUESTABLE_GATE_OUT'){
+    Object.assign(filter,{workflowStage:'STORAGE','storage.status':'STORED','gateOut.approvedAt':null,'gateOut.releasedAt':null,'gateOut.payment.status':{$nin:['SUBMITTED','VERIFIED']}});
+  }
   const search = String(req.query.search || '').trim();
   if (search) {
     const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -67,7 +75,7 @@ export const list = asyncHandler(async (req, res) => {
 
   const [items, total, summaryRows] = await Promise.all([
     PreAdvice.find(filter)
-      .select('bookingReference containerNumber containerSize containerType scheduledGateDateIn scheduledGateTimeIn shippingLine status workflowStage cancellation createdAt updatedAt gateIn.actualGateInAt storage gateOut truckPlateNumber driverName driverLicenceNumber hauler loadStatus')
+      .select('bookingReference containerNumber containerSize containerType scheduledGateDateIn scheduledGateTimeIn shippingLine status workflowStage cancellation createdAt updatedAt gateIn.actualGateInAt gateIn.inspection gateIn.payment storage gateOut truckPlateNumber driverName driverLicenceNumber hauler loadStatus')
       .populate('storage.block','name')
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
