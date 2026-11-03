@@ -97,6 +97,13 @@ const gateOutSchema = new mongoose.Schema({
   approvedAt: { type: Date, default: null },
   approvedBy: { type: String, default: null },
   readyForReleaseAt: { type: Date, default: null },
+  // Recorded by the approving admin, before Gate-out payment verification.
+  // These are retained independently of physical-release notes and cannot be
+  // inferred from the Gate-in inspection.
+  conditionUponRelease: [{type:String,enum:['GOOD','DENTED','RUST','HOLE','DOOR DAMAGE','OTHER']}],
+  conditionRemarks: {type:String,default:''},
+  conditionRecordedAt: {type:Date,default:null},
+  conditionRecordedBy: {type:String,default:null},
   releasedAt: { type: Date, default: null },
   releasedBy: { type: String, default: null },
   remarks: { type: String, default: '' },

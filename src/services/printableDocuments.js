@@ -136,14 +136,19 @@ function passData(page, booking, type) {
   const conditionY=containerY+106;
   page.section(conditionY,isOut?'Condition Upon Release':'Condition Upon Entry',isOut?C.blue:C.green,isOut?C.blueLight:C.greenLight);
   const options=['GOOD','DENTED','RUST','HOLE','DOOR DAMAGE','OTHER'];
-  const check = isOut ? [] : (booking.gateIn?.inspection?.containerCondition || []);
+  const check = isOut ? (booking.gateOut?.conditionUponRelease || []) : (booking.gateIn?.inspection?.containerCondition || []);
   const cellWidth=w/options.length;
   page.rect(x,conditionY+23,w,24,C.white,C.line);
   options.forEach((label,i)=>page.checkbox(x+13+i*cellWidth,conditionY+30,label,check.includes(label),C.ink,label.length>10?7:8));
   const remarksY=conditionY+52;
   page.section(remarksY,'Remarks',isOut?C.blue:C.green,isOut?C.blueLight:C.greenLight);
   page.rect(x,remarksY+23,w,36,C.white,C.line);
-  page.text(x+8,remarksY+27,val(isOut?booking.gateOut?.remarks:ci.remarks),9,{maxWidth:w-16});
+  // Older approved passes only have gateOut.remarks. New approvals keep the
+  // checker condition remarks separate from later physical-release notes.
+  const passRemarks=isOut
+    ? (booking.gateOut?.conditionRecordedAt ? booking.gateOut?.conditionRemarks : (booking.gateOut?.conditionRemarks || booking.gateOut?.remarks))
+    : ci.remarks;
+  page.text(x+8,remarksY+27,val(passRemarks),9,{maxWidth:w-16});
   const declarationY=remarksY+68;
   page.text(page.width/2,declarationY,isOut?'The driver acknowledges receipt of the container in the recorded condition.':'The driver acknowledges delivery of the container in the recorded condition.',8,{color:C.gray,align:'center'});
   page.text(page.width/2,declarationY+12,'Any observed damage or discrepancy must be recorded on this pass before signatures.',8,{color:C.gray,align:'center'});

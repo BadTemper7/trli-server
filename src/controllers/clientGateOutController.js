@@ -18,6 +18,7 @@ import {requireGateOutAfterGateIn} from '../utils/storageDuration.js';
 import {nextReference} from '../utils/referenceNumbers.js';
 import {uniqueReceiptNumber} from '../utils/uniqueReceipt.js';
 import {paymentReviewFailure} from '../utils/financialReviewErrors.js';
+import {parseGateOutReleaseCondition,parseGateOutReleaseRemarks} from '../utils/gateOutReleaseCondition.js';
 import {auditAdminAction} from '../services/adminAuditService.js';
 import {enqueueBookingMail} from '../services/transactionalMail.js';
 import {createNotification} from '../services/notificationService.js';
@@ -87,7 +88,8 @@ export const requestClientGateOut=asyncHandler(async(req,res)=>{
     await PaymentSubmission.create([{invoice:invoice._id,company:fresh.company,booking:fresh._id,method,reference,amount,receivingAccount:receivingAccountSnapshot(receivingMethod),proof:file?{storedName:file.filename,name:file.originalname,mimeType:file.mimetype,size:file.size}:undefined,submittedBy:req.user._id}],{session});
     fresh.gateOut.approvalStatus='PENDING_APPROVAL';fresh.gateOut.requestedAt=new Date();fresh.gateOut.requestedBy=String(req.user._id);fresh.gateOut.scheduledDate=day;fresh.gateOut.scheduledTime=hour;
     fresh.gateOut.truckPlateNumber=fresh.truckPlateNumber;fresh.gateOut.driverName=fresh.driverName;
-    fresh.gateOut.remarks='';fresh.gateOut.payment.status='SUBMITTED';fresh.gateOut.payment.amountDue=quote.total;fresh.gateOut.payment.amountSubmitted=amount;fresh.gateOut.payment.method=method;fresh.gateOut.payment.referenceNumber=reference;fresh.gateOut.payment.submittedAt=new Date();
+    fresh.gateOut.remarks='';fresh.gateOut.conditionUponRelease=[];fresh.gateOut.conditionRemarks='';fresh.gateOut.conditionRecordedAt=null;fresh.gateOut.conditionRecordedBy=null;
+    fresh.gateOut.payment.status='SUBMITTED';fresh.gateOut.payment.amountDue=quote.total;fresh.gateOut.payment.amountSubmitted=amount;fresh.gateOut.payment.method=method;fresh.gateOut.payment.referenceNumber=reference;fresh.gateOut.payment.submittedAt=new Date();
     advanceWorkflow(fresh,stages,{note:'Gate-out request and online payment proof submitted; pending admin approval'});
     await fresh.save({session});
    });
@@ -106,6 +108,7 @@ export const reviewClientGateOut=asyncHandler(async(req,res)=>{
  if(decision==='REJECT'&&!reason)throw new AppError('Rejection reason is required.',400);
  if(!mongoose.isValidObjectId(req.params.id))throw new AppError('Invalid booking identifier.',400);
  let booking,invoice,payment,alreadyReviewed=false;
+ let conditionUponRelease=[],conditionRemarks='';
  // Receipt numbers are allocated inside the same MongoDB transaction as the
  // payment, invoice, booking and audit. Retry only conflicting receipt counters.
  for(let attempt=0;attempt<4;attempt++){
@@ -134,6 +137,10 @@ export const reviewClientGateOut=asyncHandler(async(req,res)=>{
     if(!booking.gateOut?.payment||!booking.inventory)throw new AppError('Booking Gate-out state is incomplete. Contact technical support.',409);
 
     if(decision==='APPROVE'){
+     // The approving checker must explicitly record the outbound condition.
+     // Never rely on a disabled frontend button or infer it from Gate-in.
+     conditionUponRelease=parseGateOutReleaseCondition(req.body?.conditionUponRelease);
+     conditionRemarks=parseGateOutReleaseRemarks(req.body?.remarks);
      if(!Number.isFinite(Number(payment.amount))||Math.abs(Number(payment.amount)-Number(invoice.balance))>0.001)
       throw new AppError('Submitted amount does not match the outstanding invoice.',409);
      payment.receiptNumber=await uniqueReceiptNumber(session);
@@ -141,6 +148,10 @@ export const reviewClientGateOut=asyncHandler(async(req,res)=>{
      invoice.status='PAID';invoice.paidAmount=invoice.total;invoice.balance=0;invoice.paidAt=new Date();invoice.verifiedBy=req.admin._id;
      booking.gateOut.approvalStatus='APPROVED';booking.gateOut.payment.status='VERIFIED';
      booking.gateOut.approvedAt=new Date();booking.gateOut.approvedBy=String(req.admin._id);
+     booking.gateOut.conditionUponRelease=conditionUponRelease;
+     booking.gateOut.conditionRemarks=conditionRemarks;
+     booking.gateOut.conditionRecordedAt=booking.gateOut.approvedAt;
+     booking.gateOut.conditionRecordedBy=String(req.admin._id);
      booking.gateOut.readyForReleaseAt=new Date();booking.inventory.status='RELEASE_PENDING';
      advanceWorkflow(booking,['GATE_OUT_APPROVED','READY_FOR_RELEASE'],{note:'Payment verified and gate-out approved'});
     }else{
@@ -153,7 +164,8 @@ export const reviewClientGateOut=asyncHandler(async(req,res)=>{
     payment.verifiedAt=new Date();payment.verifiedBy=req.admin._id;
     await payment.save({session});await invoice.save({session});await booking.save({session});
     await auditAdminAction({performedBy:req.admin._id,action:`GATE_OUT_${decision}`,
-     changes:{bookingReference:booking.bookingReference,bookingId:String(booking._id),invoice:invoice.number,paymentId:String(payment._id),reason},session});
+     changes:{bookingReference:booking.bookingReference,bookingId:String(booking._id),invoice:invoice.number,paymentId:String(payment._id),reason,
+      ...(decision==='APPROVE'?{conditionUponRelease,conditionRemarks}:{})},session});
    });
    break;
   }catch(error){
