@@ -37,11 +37,28 @@ test('all booking views use one cascade, clearing financial and storage referenc
  assert.match(logic,/PRE_ADVICE','GATE_IN','INVENTORY','GATE_OUT','RELEASE_CONTAINER/);
  for(const target of ['PaymentSubmission','Invoice','StorageMovement','BookingSlot','Notification','EmailOutbox','PreAdvice'])assert.match(logic,new RegExp(`${target}\\.(deleteMany|updateMany)`),`${target} missing cascade`);
 });
-test('verified financial documents require explicit staging-only Super Admin override',()=>{
- assert.match(logic,/process\.env\.NODE_ENV !== 'production'/);
- assert.match(logic,/ALLOW_FINANCIAL_PURGE/);
- assert.match(logic,/role === 'SUPER_ADMIN'/);
- assert.match(logic,/Verified financial records are protected/);
+test('verified finance may be deleted with explicit acknowledgement and DELETE permission, including production',()=>{
+ assert.match(logic,/requireFinancialAcknowledgement/);
+ assert.match(logic,/acknowledgedFinancialDeletion\(req\.body\)/);
+ assert.match(logic,/includesIssuedFinancialRecords\(invoices,payments\)/);
+ assert.doesNotMatch(logic,/ALLOW_FINANCIAL_PURGE/);
+ assert.doesNotMatch(logic,/process\.env\.NODE_ENV !== 'production'/);
+});
+test('invoice deletion cascades through linked booking with extra container Delete scope',()=>{
+ assert.match(logic,/if\(module==='PAYMENT_HISTORY'\)/);
+ assert.match(logic,/hasPermission\(req\.admin,MODULES\.CONTAINER_TRACKING,ACTIONS\.DELETE\)/);
+ assert.match(logic,/purgeBookings\(linkedIds,req,session,files\)/);
+ assert.match(logic,/removedBookings:bookingCascade\.count/);
+});
+test('financial delete consent is explicit in UI and accompanies the confirmation',()=>{
+ assert.match(ui,/checked=\{control\.purgeFinancial\}/);
+ assert.match(ui,/confirmation,reason,purgeFinancial/);
+ assert.match(ui,/This action cannot be undone/);
+});
+test('Release Container defines the refresh handler passed to OperationsTable',()=>{
+ const release=fs.readFileSync(path.resolve(here,'../../admin/src/pages/ReleaseContainer/ReleaseContainerPage.jsx'),'utf8');
+ assert.match(release,/setError, load \} = usePagedOperationsList/);
+ assert.match(release,/onDeleted=\{load\}/);
 });
 test('protected Super Admin and active accounts cannot be deleted',()=>{
  assert.match(logic,/isSystemProtected/);

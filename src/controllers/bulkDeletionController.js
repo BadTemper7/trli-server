@@ -23,6 +23,7 @@ import { MODULES, ACTIONS } from '../constants/permissions.js';
 import {hasPermission} from '../middleware/requirePermission.js';
 import {auditAdminAction} from '../services/adminAuditService.js';
 import {AppError,asyncHandler} from '../utils/http.js';
+import {includesIssuedFinancialRecords,acknowledgedFinancialDeletion} from '../utils/financialDeletionPolicy.js';
 
 // Gate-in, Gate-out, Inventory, Release, and Pre-advice are views of the SAME
 // PreAdvice document. All of their Delete actions must use the same cascade.
@@ -56,19 +57,28 @@ export function parseDeletionRequest(body = {}) {
 function deleteScope(req, parsed) {
   if (!hasPermission(req.admin,parsed.module,ACTIONS.DELETE)) throw new AppError('You do not have Delete access to this module.',403);
 }
-const deniedFinance = (rows) => rows.some(p => ['VERIFIED','REFUNDED','REVERSED','VOIDED'].includes(p.status)) || false;
-function canPurgeFinancial(req) {return process.env.NODE_ENV !== 'production' && process.env.ALLOW_FINANCIAL_PURGE === 'true' && req.admin?.role === 'SUPER_ADMIN';}
+// A financial purge is an explicitly confirmed, permission-controlled operation,
+// not a bypass based on NODE_ENV. Both the deletion and its audit record are
+// committed in the same MongoDB transaction.
+function requireFinancialAcknowledgement(req, financial) {
+  if (financial && !acknowledgedFinancialDeletion(req.body)) {
+    throw new AppError('This selection includes paid invoices or verified payments. Tick the permanent financial deletion acknowledgement and confirm again.', 409);
+  }
+}
 const escapeRegex = s => String(s).replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
 
 async function preflightBookings(ids,req,session) {
-  const [bookings,invoices,payments] = await Promise.all([
+  const [bookings,invoices] = await Promise.all([
     PreAdvice.find({_id:{$in:ids}}).select('_id bookingReference containerNumber status company documents').session(session).lean(),
-    Invoice.find({booking:{$in:ids}}).select('_id number status total booking').session(session).lean(),
-    PaymentSubmission.find({booking:{$in:ids}}).select('_id status invoice receiptNumber method reference proof').session(session).lean(),
+    Invoice.find({booking:{$in:ids}}).select('_id number status total paidAmount booking').session(session).lean(),
   ]);
-  if(bookings.length!==ids.length) throw new AppError('Some selected bookings no longer exist. Refresh your list.',409);
-  const financial = invoices.some(x=>x.status==='PAID') || deniedFinance(payments);
-  if(financial && !canPurgeFinancial(req)) throw new AppError('Verified financial records are protected from hard deletion. Archive them instead, or explicitly enable financial purge in an isolated test environment with a Super Admin.',409);
+  if (bookings.length!==ids.length) throw new AppError('Some selected bookings no longer exist. Refresh your list.',409);
+  const invoiceIds = invoices.map(x=>x._id);
+  const payments = await PaymentSubmission.find({$or:[
+    {booking:{$in:ids}}, ...(invoiceIds.length ? [{invoice:{$in:invoiceIds}}] : [])
+  ]}).select('_id status booking invoice receiptNumber method reference amount verifiedAt proof').session(session).lean();
+  const financial = includesIssuedFinancialRecords(invoices,payments);
+  requireFinancialAcknowledgement(req,financial);
   return {bookings,invoices,payments,financial};
 }
 async function purgeBookings(ids,req,session,files) {
@@ -92,7 +102,10 @@ async function purgeBookings(ids,req,session,files) {
   for(const p of plan.payments)if(p.proof?.storedName)files.push(['payment-proofs',p.proof.storedName]);
   const result=await PreAdvice.deleteMany({_id:{$in:ids}},{session});
   if(result.deletedCount!==ids.length)throw new AppError('Concurrent booking deletion detected; no records were deleted.',409);
-  return {count:ids.length,financial:plan.payments.filter(p=>p.status==='VERIFIED').length,removedInvoices:plan.invoices.map(x=>({number:x.number,total:x.total,status:x.status})),bookings:plan.bookings.map(x=>({reference:x.bookingReference,container:x.containerNumber}))};
+  return {count:ids.length,financial:plan.payments.filter(p=>p.status==='VERIFIED').length,
+    removedInvoices:plan.invoices.map(x=>({number:x.number,total:x.total,paidAmount:x.paidAmount,status:x.status})),
+    removedPayments:plan.payments.map(p=>({invoice:String(p.invoice||''),status:p.status,receiptNumber:p.receiptNumber,method:p.method,reference:p.reference,amount:p.amount,verifiedAt:p.verifiedAt})),
+    bookings:plan.bookings.map(x=>({reference:x.bookingReference,container:x.containerNumber}))};
 }
 
 async function executeDelete(req,parsed,session,files) {
@@ -152,15 +165,33 @@ async function executeDelete(req,parsed,session,files) {
     await AdminUser.deleteMany({_id:{$in:ids}},{session});return {count:ids.length,users:docs.map(x=>({email:x.email,role:x.role}))};
   }
   if(module==='PAYMENT_HISTORY') {
-    const docs=await Invoice.find({_id:{$in:ids}}).session(session).lean();if(docs.length!==ids.length)throw new AppError('Some invoices no longer exist.',409);
-    if(docs.some(x=>!['UNPAID','CANCELLED','VOID'].includes(x.status)))throw new AppError('Paid or submitted invoices cannot be deleted from this table. Use the audited container deletion workflow in a test environment.',409);
+    const docs=await Invoice.find({_id:{$in:ids}}).session(session).lean();
+    if(docs.length!==ids.length)throw new AppError('Some invoices no longer exist. Refresh the list.',409);
     const payments=await PaymentSubmission.find({invoice:{$in:ids}}).session(session).lean();
-    if(deniedFinance(payments))throw new AppError('Verified payment records cannot be removed independently of their booking.',409);
-    const bookings=await PreAdvice.find({_id:{$in:docs.map(x=>x.booking)}}).select('status gateIn gateOut').session(session).lean();
-    if(bookings.some(x=>x.gateIn?.actualGateInAt || x.gateOut?.requestedAt))throw new AppError('An invoice is part of an active container transaction. Delete the container with its references instead.',409);
-    await PaymentSubmission.deleteMany({invoice:{$in:ids}},{session});await Invoice.deleteMany({_id:{$in:ids}},{session});
-    for(const p of payments)if(p.proof?.storedName)files.push(['payment-proofs',p.proof.storedName]);
-    return {count:ids.length,invoices:docs.map(x=>({number:x.number,status:x.status}))};
+    requireFinancialAcknowledgement(req,includesIssuedFinancialRecords(docs,payments));
+    // Deleting a paid invoice in isolation would leave the booking marked as
+    // paid while removing its financial proof. Cascade the COMPLETE linked
+    // booking instead, and require explicit container Delete authorization.
+    const bookingIds=distinct(docs.map(x=>String(x.booking||'')).filter(x=>mongoose.isValidObjectId(x)));
+    const linked=await PreAdvice.find({_id:{$in:bookingIds}}).select('_id').session(session).lean();
+    if(linked.length && !hasPermission(req.admin,MODULES.CONTAINER_TRACKING,ACTIONS.DELETE)
+      && !hasPermission(req.admin,MODULES.PRE_ADVICE,ACTIONS.DELETE)) {
+      throw new AppError('Deleting an invoice also removes its linked container. You need Container Tracking or Pre-advice Delete permission to continue.',403);
+    }
+    const linkedIds=linked.map(x=>x._id);
+    let bookingCascade={count:0};
+    if(linkedIds.length)bookingCascade=await purgeBookings(linkedIds,req,session,files);
+    const orphanIds=ids.filter(x=>!linked.some(b=>docs.some(i=>String(i._id)===String(x)&&String(i.booking)===String(b._id))));
+    let orphanPayments=[];
+    if(orphanIds.length){
+      orphanPayments=await PaymentSubmission.find({invoice:{$in:orphanIds}}).session(session).lean();
+      await PaymentSubmission.deleteMany({invoice:{$in:orphanIds}},{session});
+      await Invoice.deleteMany({_id:{$in:orphanIds}},{session});
+      for(const p of orphanPayments)if(p.proof?.storedName)files.push(['payment-proofs',p.proof.storedName]);
+    }
+    return {count:ids.length,removedBookings:bookingCascade.count,
+      removedInvoices:[...(bookingCascade.removedInvoices||[]),...docs.filter(x=>orphanIds.some(id=>String(id)===String(x._id))).map(x=>({number:x.number,total:x.total,status:x.status}))],
+      removedPayments:[...(bookingCascade.removedPayments||[]),...orphanPayments.map(p=>({receiptNumber:p.receiptNumber,status:p.status,amount:p.amount}))]};
   }
   throw new AppError('Unknown deletion target.',400);
 }
