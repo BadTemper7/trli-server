@@ -1,5 +1,7 @@
 import PreAdvice from '../models/PreAdvice.js';
 import Invoice from '../models/Invoice.js';
+import Rate from '../models/Rate.js';
+import { availableBookingLoadStatuses } from '../utils/bookingRateOptions.js';
 import mongoose from 'mongoose';
 import { getIO, emitToAdminModule } from '../socket/index.js';
 import { MODULES } from '../constants/permissions.js';
@@ -49,6 +51,26 @@ function validateGateInSchedule(data, existing = null) {
   const time = data.scheduledGateTimeIn ?? existing?.scheduledGateTimeIn;
   const error = validateHourlySchedule(date, time, 'Scheduled Gate-in');
   if (error) throw new AppError(error, 400);
+}
+
+// Reefer bookings must reference a currently configured and effective Reefer
+// load status. Existing bookings remain editable if only unrelated fields
+// change after a rate expires; historical financial snapshots are untouched.
+async function requireAvailableReeferLoadStatus(data, existing = null) {
+  const containerType=data.containerType??existing?.containerType;
+  if(containerType!=='REEFER')return;
+  const containerSize=data.containerSize??existing?.containerSize;
+  const transactionClassification=data.transactionClassification??existing?.transactionClassification;
+  const loadStatus=data.loadStatus??existing?.loadStatus;
+  const rates=await Rate.find({status:'ACTIVE',containerCategory:'REEFER',
+    classification:{$in:[transactionClassification,'ALL']},
+    containerSize:{$in:[containerSize,'ALL']},
+    loadStatus:{$in:['EMPTY','LOADED','ALL']},
+    $or:[{effectiveFrom:null},{effectiveFrom:{$exists:false}},{effectiveFrom:{$lte:new Date()}}],
+  }).select('status name containerCategory classification containerSize loadStatus collectionPoint effectiveFrom').lean();
+  const available=availableBookingLoadStatuses(rates,{containerType,containerSize,transactionClassification});
+  if(!available.includes(loadStatus))throw new AppError(
+    `No active Reefer ${loadStatus||'load-status'} rate is configured for ${transactionClassification} / ${containerSize}. Choose an available load status or ask an administrator to configure the rate.`,409);
 }
 
 export const availability = asyncHandler(async(req,res)=>{if(!/^\d{4}-\d{2}-\d{2}$/.test(String(req.query.day||'')))throw new AppError('A valid date is required.',400); ok(res,{slots:await slotAvailability(req.query.day)});});
@@ -113,6 +135,7 @@ export const detail = asyncHandler(async (req, res) => {
 export const create = asyncHandler(async (req, res) => {
   const data = pick(req.body);
   validateGateInSchedule(data);
+  await requireAvailableReeferLoadStatus(data);
 
   data.bookingReference = await nextReference('BOOKING');
   data.company = req.user.company._id;
@@ -159,6 +182,9 @@ export const update = asyncHandler(async (req, res) => {
   }
 
   const updates = pick(req.body);
+  if (['containerType','containerSize','loadStatus','transactionClassification'].some(k => updates[k] !== undefined && updates[k] !== item[k])) {
+    await requireAvailableReeferLoadStatus(updates, item);
+  }
   if (updates.scheduledGateDateIn !== undefined || updates.scheduledGateTimeIn !== undefined) {
     validateGateInSchedule(updates, item);
   }

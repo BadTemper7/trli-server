@@ -1,9 +1,32 @@
 import { Router } from 'express';
 import Rate from '../models/Rate.js';
 import SiteSettings from '../models/SiteSettings.js';
-import { asyncHandler } from '../utils/http.js';
+import { asyncHandler, AppError } from '../utils/http.js';
+import { availableBookingLoadStatuses } from '../utils/bookingRateOptions.js';
 
 const router = Router();
+
+// Live options for the Client Pre-Advice form. These are computed from the
+// same active Rate rows used by billing, never hard-coded Reefer assumptions.
+router.get('/load-statuses', asyncHandler(async (req,res) => {
+  const containerType=String(req.query.containerType||'').trim().toUpperCase();
+  const containerSize=String(req.query.containerSize||'').trim().toUpperCase();
+  const transactionClassification=String(req.query.classification||'').trim().toUpperCase();
+  if(!['DRY CONTAINER','REEFER','TANK CONTAINER','OPEN TOP','FLAT RACK'].includes(containerType)
+   ||!['20FT','40FT'].includes(containerSize)
+   ||!['LOCAL','INTERNATIONAL'].includes(transactionClassification))
+    throw new AppError('Valid container type, size and classification are required.',400);
+  const category=containerType==='REEFER'?'REEFER':'STANDARD';
+  const rates=await Rate.find({status:'ACTIVE',containerCategory:category,
+    classification:{$in:[transactionClassification,'ALL']},
+    containerSize:{$in:[containerSize,'ALL']},
+    loadStatus:{$in:['EMPTY','LOADED','ALL']},
+    $or:[{effectiveFrom:null},{effectiveFrom:{$exists:false}},{effectiveFrom:{$lte:new Date()}}],
+  }).select('status name containerCategory classification containerSize loadStatus collectionPoint effectiveFrom').lean();
+  const available=availableBookingLoadStatuses(rates,{containerType,containerSize,transactionClassification});
+  res.set('Cache-Control','no-store');
+  res.json({success:true,data:{loadStatuses:available}});
+}));
 
 router.get('/', asyncHandler(async (req, res) => {
   const filter = { status: 'ACTIVE', $or: [{effectiveFrom:null},{effectiveFrom:{$exists:false}},{effectiveFrom:{$lte:new Date()}}] };

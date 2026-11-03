@@ -27,7 +27,20 @@ test('overtime crosses midnight correctly',()=>{
  assert.equal(overtimeApplies('05:00',settings.overtime),true);
  assert.equal(overtimeApplies('08:00',settings.overtime),false);
 });
-test('reefer loaded is rejected by price selection',()=>assert.throws(()=>pickApplicableRates(rates,{...booking,containerType:'REEFER',loadStatus:'LOADED'})));
+test('loaded Reefer only receives its own configured rate, never Standard charges',()=>{
+ const reefer={...booking,containerType:'REEFER',loadStatus:'LOADED'};
+ assert.equal(pickApplicableRates(rates,reefer).length,0);
+ const reeferRate={...rates[0],_id:'reefer-loaded',containerCategory:'REEFER',loadStatus:'LOADED',amount:350};
+ assert.equal(pickApplicableRates([...rates,reeferRate],reefer).find(r=>r.name==='Gate-in Handling').amount,350);
+});
+test('Loaded Reefer can be invoiced at its configured VAT-inclusive price',()=>{
+ const reefer={...booking,containerType:'REEFER',loadStatus:'LOADED'};
+ const fee={...rates[0],_id:'reefer-loaded-1120',containerCategory:'REEFER',loadStatus:'LOADED',amount:1120};
+ const invoice=priceLines([fee],reefer,'GATE_IN',{tax:{vatRate:12,vatInclusive:true},shiftingFee:0,overtime:{active:false}});
+ assert.equal(invoice.total,1120);
+ assert.equal(invoice.vatableSales,1000);
+ assert.equal(invoice.vat,120);
+});
 test('financial PDF has valid header, trailer, invoice and receipt text',()=>{
  const invoice={number:'TRANS-20261026-0001',type:'GATE_IN',createdAt:'2026-10-26T12:00:00Z',lines:[{description:'Gate-in Handling',quantity:1,unitRate:200,amount:200}],vatRate:12,vatInclusive:false,subtotal:200,vat:24,total:224,paidAmount:224,balance:0,status:'PAID'};
  const pdf=renderFinancialPdf({invoice,booking:{bookingReference:'TRANS-20261026-0001',containerNumber:'ABCD1234567'},companyName:'Sample Company'});

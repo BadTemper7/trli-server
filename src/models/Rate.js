@@ -46,7 +46,6 @@ schema.pre('validate', function(next) {
     if (!Number.isFinite(sum) || Math.abs(Math.round(sum*100)-Math.round(target*100))>0 || this.gateInAllocation<0 || this.gateOutAllocation<0) return next(new Error('Both-stage allocations must add up to 100% or the configured fixed rate.'));
     if(this.allocationMode==='FIXED' && this.pricingMode==='MANUAL') return next(new Error('Manual rates must use percentage allocations.'));
   }
-  if (this.containerCategory === 'REEFER' && this.loadStatus === 'LOADED') return next(new Error('Loaded reefer rate is not supported.'));
   next();
 });
 schema.index({ name: 1, classification: 1, loadStatus: 1, containerCategory:1,containerSize: 1, collectionPoint: 1 },{unique:true,partialFilterExpression:{status:'ACTIVE'},name:'unique_active_rate_per_classification'});

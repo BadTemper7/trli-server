@@ -36,7 +36,6 @@ export function allowedRatesForCollection(rates, type) {
  */
 export function pickApplicableRates(rates, booking, collectionPoint = null) {
   const category = booking.containerType === 'REEFER' ? 'REEFER' : 'STANDARD';
-  if (category === 'REEFER' && booking.loadStatus === 'LOADED') throw new Error('Loaded reefer pricing is unsupported.');
   const eligible = rates.filter(r => {
     if (r.status !== 'ACTIVE' || (r.effectiveFrom && new Date(r.effectiveFrom) > new Date()) || r.name === 'Total Handling Reference') return false;
     if (r.name === 'Overtime') {

@@ -55,7 +55,6 @@ function cleanRateInput(body = {}) {
   const loadStatus = enumValue('loadStatus', body.loadStatus, name === 'Overtime' ? 'ALL' : undefined);
   const collectionPoint = enumValue('collectionPoint', body.collectionPoint, name === 'Overtime' ? 'BOTH' : undefined);
   if (name !== 'Overtime' && [classification,loadStatus,category].includes('ALL')) throw new AppError('Universal classification/category/load-status is supported only for Overtime.',400);
-  if (category === 'REEFER' && loadStatus === 'LOADED') throw new AppError('Loaded reefer rates are unsupported.',400);
   const billingMode = String(body.billingMode || (['Documentation Fee','Congestion Surcharge','Other'].includes(name)?'OPTIONAL':'AUTOMATIC')).toUpperCase();
   if (!['AUTOMATIC', 'OPTIONAL'].includes(billingMode)) throw new AppError('Invalid charge mode.',400);
   if (name === 'Total Handling Reference') throw new AppError('Total Handling Reference cannot be created as a billable rate.',400);

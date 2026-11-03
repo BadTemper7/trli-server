@@ -16,6 +16,8 @@ import {calculateInvoice,availableOptionalCharges,previewGateOutTransactions} fr
 import {parseOptionalRateIds} from '../utils/billingMath.js';
 import {requireGateOutAfterGateIn} from '../utils/storageDuration.js';
 import {nextReference} from '../utils/referenceNumbers.js';
+import {uniqueReceiptNumber} from '../utils/uniqueReceipt.js';
+import {paymentReviewFailure} from '../utils/financialReviewErrors.js';
 import {auditAdminAction} from '../services/adminAuditService.js';
 import {enqueueBookingMail} from '../services/transactionalMail.js';
 import {createNotification} from '../services/notificationService.js';
@@ -98,42 +100,89 @@ export const requestClientGateOut=asyncHandler(async(req,res)=>{
  }catch(e){if(!committed&&file?.path)await fs.unlink(file.path).catch(()=>{});throw e;}
 });
 export const reviewClientGateOut=asyncHandler(async(req,res)=>{
- const decision=String(req.body.decision||'').toUpperCase(),reason=String(req.body.reason||'').trim();
+ const decision=String(req.body?.decision||'').toUpperCase();
+ const reason=String(req.body?.reason||'').trim().slice(0,800);
  if(!['APPROVE','REJECT'].includes(decision))throw new AppError('Decision must be APPROVE or REJECT.',400);
  if(decision==='REJECT'&&!reason)throw new AppError('Rejection reason is required.',400);
- const session=await mongoose.startSession();let releasedSlot=null;let bookingReference='';let notifyBooking=null;
- try{
-  await session.withTransaction(async()=>{
-   const booking=await PreAdvice.findById(req.params.id).session(session);
-   if(!booking||booking.workflowStage!=='GATE_OUT_PAYMENT_SUBMITTED')throw new AppError('No gate-out payment is awaiting approval.',409);
-   const invoice=await Invoice.findOne({booking:booking._id,type:'GATE_OUT',status:'PAYMENT_SUBMITTED'}).session(session);
-   const payment=invoice&&await PaymentSubmission.findOne({invoice:invoice._id,status:'PENDING_VERIFICATION'}).session(session);
-   if(!invoice||!payment)throw new AppError('No pending invoice/payment to verify.',409);
-   bookingReference=booking.bookingReference;notifyBooking=booking;
-   if(decision==='APPROVE'){
-    if(Math.abs(payment.amount-invoice.balance)>0.001)throw new AppError('Submitted amount does not match the invoice.',409);
-    payment.status='VERIFIED';payment.verifiedAt=new Date();payment.verifiedBy=req.admin._id;payment.receiptNumber=await uniqueReceiptNumber(session);await payment.save({session});
-    invoice.status='PAID';invoice.paidAmount=invoice.total;invoice.balance=0;invoice.paidAt=new Date();invoice.verifiedBy=req.admin._id;await invoice.save({session});
-    booking.gateOut.approvalStatus='APPROVED';booking.gateOut.payment.status='VERIFIED';booking.gateOut.approvedAt=new Date();booking.gateOut.approvedBy=String(req.admin._id);booking.gateOut.readyForReleaseAt=new Date();booking.inventory.status='RELEASE_PENDING';
-    advanceWorkflow(booking,['GATE_OUT_APPROVED','READY_FOR_RELEASE'],{note:'Payment verified and gate-out approved'});
-   }else{
-    payment.status='REJECTED';payment.verifiedAt=new Date();payment.verifiedBy=req.admin._id;payment.rejectionReason=reason;await payment.save({session});
-    invoice.status='UNPAID';await invoice.save({session});
-    await releaseSlot(booking._id,booking.gateOut.scheduledDate,booking.gateOut.scheduledTime,session,'GATE_OUT');
-    booking.gateOut.approvalStatus='REJECTED';booking.gateOut.payment.status='REJECTED';booking.gateOut.remarks=reason;
-    advanceWorkflow(booking,'STORAGE',{note:`Gate-out rejected: ${reason}`});
+ if(!mongoose.isValidObjectId(req.params.id))throw new AppError('Invalid booking identifier.',400);
+ let booking,invoice,payment,alreadyReviewed=false;
+ // Receipt numbers are allocated inside the same MongoDB transaction as the
+ // payment, invoice, booking and audit. Retry only conflicting receipt counters.
+ for(let attempt=0;attempt<4;attempt++){
+  booking=null;invoice=null;payment=null;alreadyReviewed=false;
+  const session=await mongoose.startSession();
+  try{
+   await session.withTransaction(async()=>{
+    booking=await PreAdvice.findById(req.params.id).session(session);
+    if(!booking)throw new AppError('Booking not found.',404);
+    invoice=await Invoice.findOne({booking:booking._id,type:'GATE_OUT'}).session(session);
+    if(!invoice)throw new AppError('Gate-out invoice not found for this booking.',409);
+
+    // Safe to re-click after a response was lost. Never issue another receipt,
+    // charge, audit entry, or workflow transition for a completed decision.
+    if(booking.workflowStage!=='GATE_OUT_PAYMENT_SUBMITTED'||invoice.status!=='PAYMENT_SUBMITTED'){
+     const expectedStatus=decision==='APPROVE'?'VERIFIED':'REJECTED';
+     const existing=await PaymentSubmission.findOne({invoice:invoice._id,status:expectedStatus}).session(session);
+     const consistent=decision==='APPROVE'
+      ? invoice.status==='PAID'&&invoice.balance===0&&['APPROVED','RELEASED'].includes(booking.gateOut?.approvalStatus)
+      : invoice.status==='UNPAID'&&booking.gateOut?.approvalStatus==='REJECTED';
+     if(existing&&consistent){payment=existing;alreadyReviewed=true;return;}
+     throw new AppError('This Gate-out request is no longer awaiting payment review. Refresh its details.',409);
+    }
+    payment=await PaymentSubmission.findOne({invoice:invoice._id,status:'PENDING_VERIFICATION'}).session(session);
+    if(!payment)throw new AppError('No pending Gate-out payment to verify. Refresh the booking.',409);
+    if(!booking.gateOut?.payment||!booking.inventory)throw new AppError('Booking Gate-out state is incomplete. Contact technical support.',409);
+
+    if(decision==='APPROVE'){
+     if(!Number.isFinite(Number(payment.amount))||Math.abs(Number(payment.amount)-Number(invoice.balance))>0.001)
+      throw new AppError('Submitted amount does not match the outstanding invoice.',409);
+     payment.receiptNumber=await uniqueReceiptNumber(session);
+     payment.status='VERIFIED';
+     invoice.status='PAID';invoice.paidAmount=invoice.total;invoice.balance=0;invoice.paidAt=new Date();invoice.verifiedBy=req.admin._id;
+     booking.gateOut.approvalStatus='APPROVED';booking.gateOut.payment.status='VERIFIED';
+     booking.gateOut.approvedAt=new Date();booking.gateOut.approvedBy=String(req.admin._id);
+     booking.gateOut.readyForReleaseAt=new Date();booking.inventory.status='RELEASE_PENDING';
+     advanceWorkflow(booking,['GATE_OUT_APPROVED','READY_FOR_RELEASE'],{note:'Payment verified and gate-out approved'});
+    }else{
+     payment.status='REJECTED';payment.rejectionReason=reason;
+     invoice.status='UNPAID';
+     await releaseSlot(booking._id,booking.gateOut.scheduledDate,booking.gateOut.scheduledTime,session,'GATE_OUT');
+     booking.gateOut.approvalStatus='REJECTED';booking.gateOut.payment.status='REJECTED';booking.gateOut.remarks=reason;
+     advanceWorkflow(booking,'STORAGE',{note:`Gate-out rejected: ${reason}`});
+    }
+    payment.verifiedAt=new Date();payment.verifiedBy=req.admin._id;
+    await payment.save({session});await invoice.save({session});await booking.save({session});
+    await auditAdminAction({performedBy:req.admin._id,action:`GATE_OUT_${decision}`,
+     changes:{bookingReference:booking.bookingReference,bookingId:String(booking._id),invoice:invoice.number,paymentId:String(payment._id),reason},session});
+   });
+   break;
+  }catch(error){
+   const keys=Object.keys(error?.keyPattern||error?.keyValue||{});
+   if(error?.code===11000&&attempt<3&&(keys.includes('receiptNumber')||(keys.includes('type')&&keys.includes('day')))){
+    console.warn('[GATE_OUT_RECEIPT_SEQUENCE_RETRY]',{bookingId:req.params.id,attempt:attempt+1});
+    continue;
    }
-   await booking.save({session});
-   await enqueueBookingMail(booking,{event:decision==='APPROVE'?'GATE_OUT_APPROVED':'GATE_OUT_REJECTED',title:decision==='APPROVE'?'Gate-out payment verified and approved':'Gate-out request rejected',message:decision==='APPROVE'?'Your gate-out payment has been verified and your container is approved for physical release.':`Your gate-out request was rejected: ${reason}. Please submit corrected payment details.`,invoiceNumber:invoice.number,amount:payment.amount},session);
-  });
- }finally{await session.endSession();}
+   const translated=paymentReviewFailure(error);
+   if(translated===error&&!error?.status)console.error('[GATE_OUT_PAYMENT_REVIEW_FAILED]',{bookingId:req.params.id,name:error?.name,code:error?.code,message:error?.message});
+   throw translated;
+  }finally{await session.endSession();}
+ }
+ if(alreadyReviewed)return res.json({success:true,message:`Gate-out payment was already ${decision==='APPROVE'?'verified':'rejected'}. No duplicate transaction was created.`,data:{paymentId:String(payment._id)}});
 
- await auditAdminAction({performedBy:req.admin._id,action:`GATE_OUT_${decision}`,changes:{bookingReference,reason}});
- emitToAdminModule(MODULES.GATE_OUT,decision==='APPROVE'?'gate-out:approved':'gate-out:updated',{id:String(notifyBooking._id),bookingReference});
- if(decision==='APPROVE')emitToAdminModule(MODULES.RELEASE_CONTAINER,'release:queue-updated',{id:String(notifyBooking._id),bookingReference});
- getIO()?.to(`company:${notifyBooking.company}`).emit('pre-advice:workflow-updated',{id:String(notifyBooking._id),workflowStage:notifyBooking.workflowStage,workflowHistory:notifyBooking.workflowHistory,gateOut:notifyBooking.gateOut,updatedAt:notifyBooking.updatedAt});
-
- res.json({success:true,message:decision==='APPROVE'?'Payment verified and container approved for release.':'Request rejected. Client may resubmit payment details.'});
+ // Side effects after commit may fail without reversing an approved payment or
+ // misreporting it as a 500. They can be safely retried independently.
+ try{
+  await enqueueBookingMail(booking,{event:decision==='APPROVE'?'GATE_OUT_APPROVED':'GATE_OUT_REJECTED',
+   title:decision==='APPROVE'?'Gate-out payment verified and approved':'Gate-out request rejected',
+   message:decision==='APPROVE'?'Your gate-out payment has been verified and your container is approved for physical release.':`Your gate-out request was rejected: ${reason}. Please submit corrected payment details.`,
+   invoiceNumber:invoice.number,amount:payment.amount});
+ }catch(error){console.error('[GATE_OUT_NOTIFICATION_RETRY_NEEDED]',{paymentId:String(payment._id),message:error?.message});}
+ try{
+  emitToAdminModule(MODULES.GATE_OUT,decision==='APPROVE'?'gate-out:approved':'gate-out:updated',{id:String(booking._id),bookingReference:booking.bookingReference});
+  if(decision==='APPROVE')emitToAdminModule(MODULES.RELEASE_CONTAINER,'release:queue-updated',{id:String(booking._id),bookingReference:booking.bookingReference});
+  getIO()?.to(`company:${booking.company}`).emit('pre-advice:workflow-updated',{id:String(booking._id),workflowStage:booking.workflowStage,workflowHistory:booking.workflowHistory,gateOut:booking.gateOut,updatedAt:booking.updatedAt});
+ }catch(error){console.error('[GATE_OUT_SOCKET_ERROR]',{paymentId:String(payment._id),message:error?.message});}
+ res.json({success:true,message:decision==='APPROVE'?'Payment verified and container approved for release.':'Request rejected. Client may resubmit payment details.',data:{paymentId:String(payment._id)}});
 });
 
 export const detailAdminGateOut=asyncHandler(async(req,res)=>{
