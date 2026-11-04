@@ -103,7 +103,7 @@ export const requestClientGateOut=asyncHandler(async(req,res)=>{
   getIO()?.to(`company:${booking.company}`).emit('pre-advice:workflow-updated',{id:String(booking._id),workflowStage:'GATE_OUT_PAYMENT_SUBMITTED'});
   getIO()?.to(`company:${booking.company}`).emit('invoice:updated',{bookingId:String(booking._id)});
   res.json({success:true,message:'Gate-out request and payment submitted for verification.',data:{bookingId:booking._id}});
- }catch(e){if(!committed&&file?.path)await fs.unlink(file.path).catch(()=>{});throw e;}
+ }catch(e){if(!committed&&file?.path)await fs.unlink(file.path).catch(()=>{});throw paymentReviewFailure(e,{reference:req.body?.reference});}
 });
 export const reviewClientGateOut=asyncHandler(async(req,res)=>{
  const decision=String(req.body?.decision||'').toUpperCase();

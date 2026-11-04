@@ -123,7 +123,7 @@ export const submitProof = asyncHandler(async (req,res) => {
       getIO()?.to(`company:${invoice.company}`).emit('pre-advice:workflow-updated', {id:String(invoice.booking),workflowStage:'GATE_IN_PAYMENT_SUBMITTED'});
     } catch (error) {console.error('[GATE_IN_PAYMENT_ALERT_FAILED]', {paymentId:String(payment._id),message:error.message});}
     res.json({success:true,message:'Payment evidence submitted; administrator verification is required.',data:{paymentId:payment._id,invoice}});
-  }catch(e){if(!committed&&proof?.path)await fs.unlink(proof.path).catch(()=>{});throw e;}
+  }catch(e){if(!committed&&proof?.path)await fs.unlink(proof.path).catch(()=>{});throw paymentReviewFailure(e,{reference:req.body?.reference});}
 });
 
 export const reviewPayment = asyncHandler(async (req,res) => {
@@ -175,7 +175,7 @@ export const reviewPayment = asyncHandler(async (req,res) => {
         continue;
       }
     if(error?.code===11000)console.error('[PAYMENT_REVIEW_UNIQUE_CONFLICT]',{paymentId:String(req.params.id),index:error?.index,keyPattern:error?.keyPattern,code:error.code});
-    const translated=paymentReviewFailure(error);
+    const translated=paymentReviewFailure(error,{reference:payment?.reference});
     if (translated===error && !error?.status) console.error('[GATE_IN_PAYMENT_REVIEW_FAILED]',{
       paymentId:String(req.params.id),errorName:error?.name,errorCode:error?.code,message:error?.message,
     });
