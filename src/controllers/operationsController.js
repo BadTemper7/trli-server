@@ -97,9 +97,10 @@ async function paymentSummary(item, collectionPoint) {
     paymentStatus:invoice.status,charges:invoice.lines||[],total:invoice.total,
     subtotal:invoice.subtotal,vat:invoice.vat,
   };
-  // Historical records without an invoice can still show their legacy rate data.
-  const charges = await matchingRates(item, collectionPoint);
-  return { charges, total: charges.reduce((sum, row) => sum + Number(row.amount || 0), 0) };
+  // Never present raw tariff amounts as the payable total. That omitted VAT,
+  // storage-day quantities and Collect at Both allocations for legacy rows.
+  return {invoiceId:null,paymentStatus:'NOT_INVOICED',charges:[],total:null,
+    subtotal:null,vat:null,needsInvoice:true};
 }
 
 async function validatePaymentMethod(method, referenceNumber, total) {
@@ -304,7 +305,7 @@ export const listGateIn = asyncHandler(async (req, res) => {
   const Invoice=(await import('../models/Invoice.js')).default;
   const invoices = rows.length ? await Invoice.find({
     booking: { $in: rows.map(row => row._id) }, type: 'GATE_IN',
-  }).select('booking number total lines status').lean() : [];
+  }).select('booking number total lines status subtotal vat vatRate vatInclusive vatableSales nonVatableSales paidAmount balance').lean() : [];
   const byBooking = new Map(invoices.map(invoice => [String(invoice.booking), invoice]));
   const items = rows.map(row => {
     const invoice = byBooking.get(String(row._id));
@@ -312,6 +313,10 @@ export const listGateIn = asyncHandler(async (req, res) => {
       invoiceId: invoice?._id ? String(invoice._id) : null,
       total: invoice?.total ?? 0, charges: invoice?.lines || [],
       invoiceNumber: invoice?.number, paymentStatus: invoice?.status,
+      subtotal: invoice?.subtotal ?? null, vat: invoice?.vat ?? null,
+      vatRate: invoice?.vatRate ?? null, vatInclusive: invoice?.vatInclusive ?? false,
+      vatableSales: invoice?.vatableSales ?? null, nonVatableSales: invoice?.nonVatableSales ?? null,
+      paidAmount: invoice?.paidAmount ?? 0, balance: invoice?.balance ?? null,
     } });
   });
   res.json({ success: true, message: 'Gate-in queue loaded.', data: { items, pagination } });
@@ -511,14 +516,15 @@ export const listGateOut = asyncHandler(async (req, res) => {
   const Invoice = (await import('../models/Invoice.js')).default;
   const invoices = rows.length ? await Invoice.find({
     booking: { $in: rows.map(row => row._id) }, type: 'GATE_OUT',
-  }).select('booking number status lines total subtotal vat').lean() : [];
+  }).select('booking number status lines total subtotal vat vatRate vatInclusive vatableSales nonVatableSales paidAmount balance').lean() : [];
   const byBooking = new Map(invoices.map(invoice => [String(invoice.booking), invoice]));
   const items = await Promise.all(rows.map(async row => {
     const invoice = byBooking.get(String(row._id));
     const payment = invoice ? {
       invoiceId: String(invoice._id), invoiceNumber: invoice.number,
       paymentStatus: invoice.status, charges: invoice.lines || [], total: invoice.total,
-      subtotal: invoice.subtotal, vat: invoice.vat,
+      subtotal: invoice.subtotal, vat: invoice.vat, vatRate: invoice.vatRate, vatInclusive: invoice.vatInclusive,
+      vatableSales:invoice.vatableSales, nonVatableSales:invoice.nonVatableSales, paidAmount:invoice.paidAmount,balance:invoice.balance,
     } : await paymentSummary(row, 'GATE_OUT');
     return itemDto(row, { gateOutCharges: payment });
   }));

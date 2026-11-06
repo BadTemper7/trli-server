@@ -3,20 +3,31 @@ import Rate from '../models/Rate.js';
 import SiteSettings from '../models/SiteSettings.js';
 import {nextReference} from '../utils/referenceNumbers.js';
 import {AppError} from '../utils/http.js';
-import {priceLines, getOptionalRateChoices, optionalPriceLines, parseOptionalRateIds, totalsForLines, gateOutTransactionPreview, allowedRatesForCollection, pickApplicableRates} from '../utils/billingMath.js';
+import {priceLines, getOptionalRateChoices, optionalPriceLines, parseOptionalRateIds, totalsForLines, gateOutTransactionPreview} from '../utils/billingMath.js';
+import {ratesForNewInvoice} from '../utils/billingRateSelection.js';
 
-async function activeRates(type, session = null) {
-  const query = Rate.find({status:'ACTIVE',collectionPoint:{$in:[type,'BOTH']},$or:[{effectiveFrom:null},{effectiveFrom:{$exists:false}},{effectiveFrom:{$lte:new Date()}}]});
+async function activeRates(session = null) {
+  const query = Rate.find({status:'ACTIVE',$or:[{effectiveFrom:null},{effectiveFrom:{$exists:false}},{effectiveFrom:{$lte:new Date()}}]});
   return (session ? query.session(session) : query).lean();
 }
+async function selectedRates(booking, type, session = null) {
+  const current = await activeRates(session);
+  const previous = type === 'GATE_OUT'
+    ? await (session ? Invoice.findOne({booking:booking._id,type:'GATE_IN'}).session(session) : Invoice.findOne({booking:booking._id,type:'GATE_IN'})).lean()
+    : null;
+  return {rates: ratesForNewInvoice(booking,type,current,previous),previous};
+}
 export async function availableOptionalCharges(booking, type, session = null) {
-  try { return getOptionalRateChoices(booking.rateSnapshots?.length?booking.rateSnapshots:await activeRates(type, session), booking,type); }
-  catch(error) { throw new AppError(error.message,409); }
+  try {
+    const {rates} = await selectedRates(booking,type,session);
+    return getOptionalRateChoices(rates, booking, type);
+  } catch(error) { throw new AppError(error.message,409); }
 }
 /** Show current matching Gate-out transactions before scheduling; never substitutes for a quote. */
 export async function previewGateOutTransactions(booking) {
   try {
-    return gateOutTransactionPreview(booking.rateSnapshots?.length?booking.rateSnapshots:await activeRates('GATE_OUT'), booking, booking.billingSettingsSnapshot||await SiteSettings.findOne({key:'COMPANY_CONTACT'}).lean() || {});
+    const {rates} = await selectedRates(booking,'GATE_OUT');
+    return gateOutTransactionPreview(rates, booking, await SiteSettings.findOne({key:'COMPANY_CONTACT'}).lean() || {});
   } catch (error) {
     throw new AppError(error.message,409);
   }
@@ -24,10 +35,12 @@ export async function previewGateOutTransactions(booking) {
 
 export async function calculateInvoice(booking,type,options={}) {
   if(!['GATE_IN','GATE_OUT'].includes(type))throw new AppError('Invalid invoice type.',400);
-  const settings=booking.billingSettingsSnapshot||await SiteSettings.findOne({key:'COMPANY_CONTACT'}).lean()||{};
-  const currentRates=await Rate.find({status:'ACTIVE', $or:[{effectiveFrom:null},{effectiveFrom:{$exists:false}},{effectiveFrom:{$lte:new Date()}}]}).lean();
-  const rates=booking.rateSnapshots?.length ? booking.rateSnapshots : currentRates;
+  // Gate-out is a new transaction: use current VAT and overtime settings.
+  // Gate-in continues using its original settings snapshot when provided.
+  const settings=(type==='GATE_IN'?booking.billingSettingsSnapshot:null)||await SiteSettings.findOne({key:'COMPANY_CONTACT'}).lean()||{};
+  const currentRates=await activeRates();
   const previousInvoice=type==='GATE_OUT'?await Invoice.findOne({booking:booking._id,type:'GATE_IN'}).lean():null;
+  const rates=ratesForNewInvoice(booking,type,currentRates,previousInvoice);
   try {
     // A stored container must have its contracted Storage charge configured.
     // Otherwise a quote containing only an optional service or OT could be
@@ -40,7 +53,9 @@ export async function calculateInvoice(booking,type,options={}) {
       }
     }
     const ids = parseOptionalRateIds(options.optionalRateIds || []);
-    const quoted=priceLines(rates,booking,type,settings,new Date(),ids,{previousInvoice,manualAmounts:booking.manualRateAmounts});
+    const quoted=priceLines(rates,booking,type,settings,new Date(),ids,{previousInvoice,manualAmounts:booking.manualRateAmounts,
+      // Only admin corrections of previously issued invoices may preserve legacy VAT inclusion.
+      existingInvoiceVatInclusive:options.existingInvoiceVatInclusive===true});
     if (!quoted.lines.length) {
       const className=String(booking.transactionClassification || 'Unspecified');
       const category=booking.containerType==='REEFER'?'REEFER':'STANDARD';
@@ -48,7 +63,7 @@ export async function calculateInvoice(booking,type,options={}) {
       throw new AppError(`No ${type === 'GATE_OUT' ? 'Gate-out' : 'Gate-in'} transactions are configured for ${details}. Ask an administrator to configure matching ACTIVE rates with Collect At: ${type === 'GATE_OUT' ? 'Gate-out' : 'Gate-in'}.`,409);
     }
     const rateSnapshots=type==='GATE_IN' && !booking.rateSnapshots?.length ? currentRates.map(r=>({...r,_id:String(r._id)})) : undefined;
-    const billingSettingsSnapshot=type==='GATE_IN' && !booking.billingSettingsSnapshot ? {tax:{vatRate:Number(settings.tax?.vatRate??12),vatInclusive:true},overtime:settings.overtime,shiftingFee:settings.shiftingFee,storageBilling:settings.storageBilling} : undefined;
+    const billingSettingsSnapshot=type==='GATE_IN' && !booking.billingSettingsSnapshot ? {tax:{vatRate:Number(settings.tax?.vatRate??12),vatInclusive:false},overtime:settings.overtime,shiftingFee:settings.shiftingFee,storageBilling:settings.storageBilling} : undefined;
     return {...quoted,optionalRateIds:ids,balance:quoted.total,rateSnapshots,billingSettingsSnapshot};
   } catch(err) { if(err instanceof AppError)throw err;throw new AppError(err.message,409); }
 }
@@ -58,7 +73,7 @@ export async function updateUnpaidInvoiceOptionalCharges(invoice, booking, selec
   if(invoice.status!=='UNPAID' || invoice.type!=='GATE_IN')throw new AppError('Only an unpaid Gate-in invoice can be adjusted before payment submission.',409);
   try {
     const ids=parseOptionalRateIds(selectedRateIds);
-    const rates=booking.rateSnapshots?.length?booking.rateSnapshots:await activeRates(invoice.type,session);
+    const {rates}=await selectedRates(booking,invoice.type,session);
     const optionalLines=optionalPriceLines(rates,booking,ids,invoice.type,{manualAmounts:{...Object.fromEntries(booking.manualRateAmounts||[]),...manualAmounts}});
     // Old invoices do not have isOptional, so their original fixed lines are retained.
     const automaticLines=(invoice.lines||[]).filter(line=>!line.isOptional)

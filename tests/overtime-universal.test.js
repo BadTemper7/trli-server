@@ -21,7 +21,7 @@ test('universal BOTH overtime applies once for local and international, standard
     const result=priceLines([row('a')],booking,gate,settings);
     assert.equal(amount(result).length,1,`${gate} ${JSON.stringify(config)}`);
     assert.equal(amount(result)[0].amount,gate==='GATE_IN'?137.5:275);
-    assert.equal(result.vat,gate==='GATE_IN'?14.73:29.46);
+    assert.equal(result.vat,gate==='GATE_IN'?16.5:33);
   }
  }
  assert.equal(configurations.length,12);
@@ -47,10 +47,10 @@ test('equal-dimension gate-specific override beats BOTH; more specific BOTH stil
  assert.equal(amount(priceLines(moreSpecific,baseBooking,'GATE_OUT',settings))[0].amount,390);
 });
 
-test('legacy specific Gate-in only OT rate remains applicable only to Gate-in; Settings fills Gate-out',()=>{
+test('specific Gate-in-only OT rate stays at Gate-in and suppresses the legacy fallback at Gate-out',()=>{
  const legacy=row('e',{classification:'LOCAL',containerCategory:'STANDARD',loadStatus:'EMPTY',containerSize:'20FT',collectionPoint:'GATE_IN',amount:315});
  assert.equal(amount(priceLines([legacy],baseBooking,'GATE_IN',settings))[0].amount,315);
- assert.equal(amount(priceLines([legacy],baseBooking,'GATE_OUT',settings))[0].amount,160);
+ assert.equal(amount(priceLines([legacy],baseBooking,'GATE_OUT',settings)).length,0);
 });
 
 test('OT applies from 18:00 through 07:59, stops at 08:00, and is disabled globally if turned off',()=>{
@@ -96,7 +96,7 @@ test('Rate model, rate-validation and admin UI support wildcard OT but keep othe
  assert.match(form,/value="BOTH"/);
  assert.match(form,/All classifications/);
  assert.match(form,/All load statuses/);
- assert.match(service,/collectionPoint:\{\$in:\[type,'BOTH'\]\}/);
+ assert.match(service,/ratesForNewInvoice/);
  assert.match(publicApi,/settings-overtime/);
 });
 

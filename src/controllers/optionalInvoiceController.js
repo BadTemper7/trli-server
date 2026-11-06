@@ -1,7 +1,9 @@
 import mongoose from 'mongoose';
 import Invoice from '../models/Invoice.js';
 import PreAdvice from '../models/PreAdvice.js';
-import {availableOptionalCharges,updateUnpaidInvoiceOptionalCharges} from '../services/invoicingService.js';
+import {availableOptionalCharges,updateUnpaidInvoiceOptionalCharges,calculateInvoice} from '../services/invoicingService.js';
+import PaymentSubmission from '../models/PaymentSubmission.js';
+import {clearSummaryCache} from '../utils/summaryCache.js';
 import {auditAdminAction} from '../services/adminAuditService.js';
 import {enqueueBookingMail} from '../services/transactionalMail.js';
 import {AppError,asyncHandler} from '../utils/http.js';
@@ -37,4 +39,53 @@ export const updateInvoiceOptionalCharges = asyncHandler(async(req,res)=>{
   emitToAdminModule(MODULES.GATE_IN,'gate-in:updated',{id:String(booking._id),bookingReference:booking.bookingReference});
   getIO()?.to(`company:${booking.company}`).emit('invoice:updated',{id:String(updated._id),bookingId:String(booking._id),total:updated.total});
   res.json({success:true,message:'Optional charges updated and Gate-in invoice recalculated.',data:{invoice:updated}});
+});
+
+/**
+ * Re-quote an existing UNPAID Gate-in invoice after Rate Setup changes.
+ * This must be an explicit admin action; neither a client GET nor a socket
+ * event is permitted to silently modify an issued financial document.
+ * Already submitted/verified payments and physical arrivals are immutable.
+ */
+export const refreshUnpaidGateInInvoice = asyncHandler(async (req, res) => {
+  const session = await mongoose.startSession();
+  let invoice, booking, oldTotal;
+  try {
+    await session.withTransaction(async () => {
+      invoice = await Invoice.findOne({_id:req.params.id,type:'GATE_IN',status:'UNPAID'}).session(session);
+      if (!invoice) throw new AppError('Only an unpaid Gate-in invoice can be refreshed.',409);
+      if (invoice.vatInclusive) throw new AppError('This historical VAT-inclusive invoice requires a formal billing adjustment. Its original tax treatment must be preserved.',409);
+      booking = await PreAdvice.findById(invoice.booking).session(session);
+      if (!booking || booking.gateIn?.actualGateInAt || !['READY_FOR_GATE_IN','GATE_IN_PAYMENT_SUBMITTED'].includes(booking.workflowStage))
+        throw new AppError('Gate-in has already been processed or the booking is no longer eligible for re-pricing.',409);
+      const activePayment = await PaymentSubmission.exists({invoice:invoice._id,status:{$in:['PENDING_VERIFICATION','VERIFIED']}}).session(session);
+      if (activePayment || Number(invoice.paidAmount||0)>0) throw new AppError('Submitted or verified payment prevents invoice re-pricing.',409);
+      // Explicitly discard the outdated Gate-in rate/settings snapshots for
+      // this NEW quote. The original invoice is still available in audit logs.
+      const freshBooking={...booking.toObject(),rateSnapshots:[],billingSettingsSnapshot:null};
+      const quote=await calculateInvoice(freshBooking,'GATE_IN',{optionalRateIds:(invoice.optionalRateIds||[]).map(String)});
+      const {rateSnapshots,billingSettingsSnapshot,...values}=quote;
+      oldTotal=invoice.total;
+      invoice.set({...values,status:'UNPAID',paidAmount:0,balance:quote.total});
+      await invoice.save({session});
+      booking.rateSnapshots=rateSnapshots;
+      booking.billingSettingsSnapshot=billingSettingsSnapshot;
+      booking.gateIn.payment.amountDue=invoice.total;
+      await booking.save({session});
+      await auditAdminAction({performedBy:req.admin._id,action:'GATE_IN_INVOICE_REPRICED',
+        changes:{invoiceId:String(invoice._id),invoiceNumber:invoice.number,bookingReference:booking.bookingReference,
+          oldTotal,newTotal:invoice.total,subtotal:invoice.subtotal,vat:invoice.vat,
+          lines:invoice.lines.map(line=>({description:line.description,amount:line.amount,rateId:String(line.rateId||'')}))},session});
+    });
+  } finally { await session.endSession(); }
+  clearSummaryCache();
+  emitToAdminModule(MODULES.GATE_IN,'gate-in:updated',{id:String(booking._id),bookingReference:booking.bookingReference});
+  emitToAdminModule(MODULES.PAYMENT_HISTORY,'invoice:updated',{id:String(invoice._id),bookingId:String(booking._id)});
+  getIO()?.to(`company:${booking.company}`).emit('invoice:updated',{id:String(invoice._id),bookingId:String(booking._id),total:invoice.total});
+  // Notification failures cannot roll back an already-committed financial change.
+  try { await enqueueBookingMail(booking,{event:'GATE_IN_INVOICE_UPDATED',title:'Gate-in invoice updated',
+    message:'Your unpaid Gate-in invoice has been recalculated using current configured transactions and VAT. Please review the new amount before paying.',
+    invoiceNumber:invoice.number,amount:invoice.total}); }
+  catch(error) {console.error('[GATE_IN_REPRICE_NOTIFICATION_FAILED]',{invoiceId:String(invoice._id),message:error.message});}
+  res.json({success:true,message:'Unpaid Gate-in charges and VAT refreshed from Rate Setup.',data:{invoice,oldTotal}});
 });

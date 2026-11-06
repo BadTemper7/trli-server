@@ -159,10 +159,17 @@ export const editContainer=asyncHandler(async(req,res)=>{
       ...['gateIn','storage','gateOut'].flatMap(key=>Object.entries(updates[key]||{}).map(([field,value])=>[`${key}.${field}`,value])),
     ]);
     const repriceGateOut=invoice?.status==='UNPAID'&&['gateIn','storage','gateOut','containerSize','containerType','loadStatus','transactionClassification'].some(k=>Object.prototype.hasOwnProperty.call(updates,k));
-    const adjustedInvoice=repriceGateOut?await calculateInvoice(next,'GATE_OUT',{optionalRateIds:invoice.optionalRateIds||[]}):null;
+    // Repricing an existing unpaid invoice preserves the invoice's tax basis.
+    // New invoices use VAT-exclusive rates; old issued invoices stay unchanged.
+    const adjustedInvoice=repriceGateOut?await calculateInvoice(next,'GATE_OUT',{
+      optionalRateIds:invoice.optionalRateIds||[], existingInvoiceVatInclusive:invoice.vatInclusive===true,
+    }):null;
     const session=await mongoose.startSession();
     try{await session.withTransaction(async()=>{
-      if(adjustedInvoice)await Invoice.updateOne({_id:invoice._id,status:'UNPAID'},{$set:{lines:adjustedInvoice.lines,optionalRateIds:adjustedInvoice.optionalRateIds,subtotal:adjustedInvoice.subtotal,vat:adjustedInvoice.vat,total:adjustedInvoice.total,balance:adjustedInvoice.total}},{session});
+      if(adjustedInvoice)await Invoice.updateOne({_id:invoice._id,status:'UNPAID'},{$set:{lines:adjustedInvoice.lines,optionalRateIds:adjustedInvoice.optionalRateIds,subtotal:adjustedInvoice.subtotal,
+        vat:adjustedInvoice.vat,total:adjustedInvoice.total,balance:adjustedInvoice.total,vatRate:adjustedInvoice.vatRate,
+        vatInclusive:adjustedInvoice.vatInclusive,vatableSales:adjustedInvoice.vatableSales,
+        nonVatableSales:adjustedInvoice.nonVatableSales}},{session});
       await PreAdvice.updateOne({_id:doc._id},{$set:corrections,$push:{statusHistory:{status:'RECORD_CORRECTION',changedAt:new Date(),note:String(req.body.changeReason||'').slice(0,300)}}},{session});
       await auditAdminAction({performedBy:req.admin._id,action:'LIVE_CONTAINER_CORRECTED',changes:{containerId:String(doc._id),before:{containerNumber:before.containerNumber,gateIn:before.gateIn,storage:before.storage,gateOut:before.gateOut},updates},session});
     });}finally{await session.endSession();}

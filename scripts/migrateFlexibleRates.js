@@ -27,7 +27,7 @@ else{
       // use a single split rate; paid historical invoices are not recalculated.
       if(Object.keys(updates).length)changes.push({collection:'rates',id:rate._id,updates});
     }
-    for(const item of settings){if(item.tax?.vatInclusive!==true)changes.push({collection:'sitesettings',id:item._id,updates:{'tax.vatInclusive':true}});}
+    for(const item of settings){if(item.tax?.vatInclusive!==false)changes.push({collection:'sitesettings',id:item._id,updates:{'tax.vatInclusive':false}});}
     console.log(JSON.stringify({mode:applying?'apply':'dry-run',ratesExamined:rates.length,settingsExamined:settings.length,changesPlanned:changes.length,changes:changes.slice(0,20).map(x=>({collection:x.collection,id:String(x.id),updates:x.updates}))},null,2));
     if(applying){
       for(const change of changes){await mongoose.connection.db.collection(change.collection).updateOne({_id:change.id},{$set:change.updates});}

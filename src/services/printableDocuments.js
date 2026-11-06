@@ -227,7 +227,7 @@ function invoiceTotals(page,invoice,lines,showTotals) {
     page.text(36,584+i*22,label,8,{color:C.green,bold:true});
     page.text(256,584+i*22,peso(value),8,{align:'right'});
   });
-  const summary=[['Subtotal',invoice.subtotal],['VAT ('+taxRate+'%)',invoice.vat],['Total Amount Due',invoice.total],['Amount Paid',invoice.paidAmount],['Balance',invoice.balance]];
+  const summary=[[invoice.vatInclusive?'Subtotal (VAT included)':'Subtotal (before VAT)',invoice.subtotal],[`VAT (${taxRate}% ${invoice.vatInclusive?'included':'added'})`,invoice.vat],['Total Amount Due',invoice.total],['Amount Paid',invoice.paidAmount],['Balance',invoice.balance]];
   summary.forEach(([label,value],i)=>{
     page.rect(285,578+i*25,281,25,i===2?C.greenLight:C.white,C.line,.6);
     page.text(292,584+i*25,label,9,{bold:i===2,color:i===2?C.green:C.ink});

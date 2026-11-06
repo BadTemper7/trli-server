@@ -70,6 +70,13 @@ export function pickApplicableRates(rates, booking, collectionPoint = null) {
   return [...chosen.values()];
 }
 
+/** A configured service takes precedence over the old Settings fallback even
+ * when it is collected at the OTHER gate. Respect its collection-point choice.
+ */
+export function hasConfiguredService(rates, booking, name) {
+  return rates.some(rate => rate.name === name && pickApplicableRates([rate],booking).length > 0);
+}
+
 export function getOptionalRateChoices(rates, booking, type = null) {
   return pickApplicableRates(type?allowedRatesForCollection(rates,type):rates, booking, type)
     .filter(r => rateBillingMode(r) === 'OPTIONAL')
@@ -93,9 +100,9 @@ export function gateOutTransactionPreview(rates, booking, settings = {}) {
     basis: rate.name === 'Storage' ? 'PER_CALENDAR_DAY' : rate.name === 'Overtime' ? 'CONDITIONAL_OVERTIME' : 'PER_TRANSACTION',
     isOptional: rateBillingMode(rate) === 'OPTIONAL',
   });
-  const automatic = matches.filter(rate => rateBillingMode(rate) === 'AUTOMATIC' && rate.name !== 'Shifting Fee').map(toItem);
+  const automatic = matches.filter(rate => rateBillingMode(rate) === 'AUTOMATIC').map(toItem);
   // Preview the Settings fallback when no explicit matching OT rate exists.
-  if (!matches.some(r => r.name === 'Overtime') && settings.overtime?.active !== false && Number(settings.overtime?.fee) > 0) {
+  if (!hasConfiguredService(rates, booking, 'Overtime') && settings.overtime?.active !== false && Number(settings.overtime?.fee) > 0) {
     automatic.push({ id: 'settings-overtime', name: 'Overtime', description: `Configured universal overtime (${settings.overtime.start || '18:00'}-${settings.overtime.end || '08:00'} Asia/Manila)`, amount: money(settings.overtime.fee), taxTreatment: 'TAXABLE', basis: 'CONDITIONAL_OVERTIME', isOptional: false });
   }
   const optional = matches.filter(rate => rateBillingMode(rate) === 'OPTIONAL').map(toItem);
@@ -160,14 +167,19 @@ function makeRateLine(rate,booking,type,options,isOptional=false) {
     pricingMode:rate.pricingMode||'FIXED',collectionPoint:rate.collectionPoint};
 }
 
-export function totalsForLines(lines, vatRate = 12, vatInclusive = true) {
+/** New rates are VAT-exclusive. The explicit legacy `vatInclusive` flag is
+ * accepted only when recalculating an existing, previously issued invoice.
+ * NEVER infer the tax basis from SiteSettings or charge tax to exempt rows.
+ */
+export function totalsForLines(lines, vatRate = 12, vatInclusive = false) {
   if (!Number.isFinite(Number(vatRate)) || Number(vatRate) < 0 || Number(vatRate) > 100) throw new Error('Invalid VAT settings.');
   const taxableSubtotal=money(lines.filter(line => (line.taxTreatment||'TAXABLE')==='TAXABLE').reduce((n,line)=>n+Number(line.amount||0),0));
   const nonVatableSales=money(lines.filter(line => (line.taxTreatment||'TAXABLE')!=='TAXABLE').reduce((n,line)=>n+Number(line.amount||0),0));
   const subtotal=money(taxableSubtotal+nonVatableSales);
   const vat=money(vatInclusive ? taxableSubtotal*Number(vatRate)/(100+Number(vatRate)) : taxableSubtotal*Number(vatRate)/100);
   const vatableSales=money(taxableSubtotal-(vatInclusive?vat:0));
-  return {lines,subtotal,vat,total:money(subtotal+(vatInclusive?0:vat)),taxableSubtotal,vatableSales,nonVatableSales,vatRate:Number(vatRate),vatInclusive:Boolean(vatInclusive)};
+  const total=money(subtotal+(vatInclusive?0:vat));
+  return {lines,subtotal,vat,total,subtotalWithVat:total,taxableSubtotal,vatableSales,nonVatableSales,vatRate:Number(vatRate),vatInclusive:Boolean(vatInclusive)};
 }
 
 /**
@@ -187,7 +199,7 @@ export function priceLines(rates, booking, type, settings, now = new Date(), opt
   const shifting=applicable.find(r=>r.name==='Shifting Fee');
   // Settings fallback is Gate-in only. An explicit Rate Setup row follows its own collection stage.
   if(shifting && rateBillingMode(shifting)==='AUTOMATIC') lines.push(makeRateLine(shifting,booking,type,context));
-  else if(type==='GATE_IN'&&!shifting&&Number(settings.shiftingFee||0)>0) {
+  else if(type==='GATE_IN'&&!hasConfiguredService(rates,booking,'Shifting Fee')&&Number(settings.shiftingFee||0)>0) {
     const fee=money(settings.shiftingFee);
     lines.push({description:'Shifting Fee',quantity:1,unitRate:fee,fullAmount:fee,amount:fee,taxTreatment:'TAXABLE',isOptional:false,collectionPoint:'GATE_IN'});
   }
@@ -195,11 +207,13 @@ export function priceLines(rates, booking, type, settings, now = new Date(), opt
   if(overtimeApplies(time,settings.overtime||{active:true,start:'18:00',end:'08:00'})){
     const overtime=applicable.find(r=>r.name==='Overtime');
     if(overtime&&rateBillingMode(overtime)==='AUTOMATIC')lines.push(makeRateLine(overtime,booking,type,context));
-    else if(!overtime&&Number(settings.overtime?.fee||0)>0){
+    else if(!hasConfiguredService(rates,booking,'Overtime')&&Number(settings.overtime?.fee||0)>0){
       const fee=money(settings.overtime.fee);
       lines.push({description:'Overtime',quantity:1,unitRate:fee,fullAmount:fee,amount:fee,taxTreatment:'TAXABLE',isOptional:false,collectionPoint:type});
     }
   }
-  // New invoices are always VAT-inclusive regardless of historical SiteSettings.vatInclusive.
-  return totalsForLines(lines.filter(line=>line.amount>0),Number(settings.tax?.vatRate??12),true);
+  // New invoices use the configured net rates, plus VAT on TAXABLE lines.
+  // Legacy invoice corrections must explicitly pass the original tax basis.
+  const useHistoricalInclusive = options.existingInvoiceVatInclusive === true;
+  return totalsForLines(lines.filter(line=>line.amount>0),Number(settings.tax?.vatRate??12),useHistoricalInclusive);
 }

@@ -63,3 +63,23 @@ test('All document downloads require module permission',()=>{
   assert.match(routes,/gate-in\/:id\/pass'.*MODULES\.GATE_IN/);
   assert.match(routes,/release\/:id\/pass'.*MODULES\.RELEASE_CONTAINER/);
 });
+
+test('VAT-exclusive service invoice PDF prints PHP 3,800 base, PHP 456 VAT, PHP 4,256 due',()=>{
+  const quote={...invoice,number:'TRANS-VAT-EXCLUSIVE-3800',vatRate:12,vatInclusive:false,
+    lines:[{description:'Gate-in Handling',quantity:1,unitRate:3800,amount:3800,taxTreatment:'TAXABLE'}],
+    subtotal:3800,vatableSales:3800,nonVatableSales:0,vat:456,total:4256,balance:4256};
+  const pdf=renderServiceInvoicePdf({invoice:quote,booking,companyName:'Sample Company'});
+  for(const expected of ['VATable Sales','3,800.00','456.00','4,256.00','before VAT','12% added']) {
+    assert.ok(text(pdf).includes(expected),expected);
+  }
+});
+
+test('previously issued VAT-inclusive PDFs still show included tax and unchanged total',()=>{
+  const legacy={...invoice,number:'TRANS-LEGACY-VAT-1120',vatRate:12,vatInclusive:true,
+    lines:[{description:'Gate-in Handling',quantity:1,unitRate:1120,amount:1120,taxTreatment:'TAXABLE'}],
+    subtotal:1120,vatableSales:1000,nonVatableSales:0,vat:120,total:1120,balance:1120};
+  const pdf=renderServiceInvoicePdf({invoice:legacy,booking,companyName:'Sample Company'});
+  for(const expected of ['VATable Sales','1,000.00','120.00','1,120.00','VAT included','12% included']) {
+    assert.ok(text(pdf).includes(expected),expected);
+  }
+});

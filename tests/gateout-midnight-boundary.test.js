@@ -23,8 +23,8 @@ test('new Gate-out quotes use inclusive calendar dates even when stored legacy s
  const q=priceLines([rate],booking,'GATE_OUT',{storageBilling:{rounding:'CEIL_24_HOURS'},tax:{vatRate:12,vatInclusive:false},overtime:{active:false}});
  assert.equal(q.lines.find(line=>line.description==='Storage').quantity,2);
  assert.equal(q.subtotal,1600);
- assert.equal(q.vat,171.43);
- assert.equal(q.total,1600);
+ assert.equal(q.vat,192);
+ assert.equal(q.total,1792);
 });
 test('same date after entry is one day',()=>{
  assert.equal(billableStorageDays(arrival,'2026-10-27','22:00'),1);

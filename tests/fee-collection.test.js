@@ -26,14 +26,14 @@ test('Documentation Fee is optional and not silently added to Gate-in',()=>{
  assert.equal(q.lines.find(r=>r.description==='Shifting Fee').amount,250); // rate overrides legacy Settings 120
  assert.equal(q.lines.find(r=>r.description==='Overtime').amount,400); // Rate overrides Settings 300
  assert.equal(q.subtotal,1500); // handling 800 + lift on 50 + shifting 250 + OT 400
- assert.equal(q.vat,160.71);
- assert.equal(q.total,1500);
+ assert.equal(q.vat,180);
+ assert.equal(q.total,1680);
 });
 test('Manual optional Documentation Fee changes total and VAT exactly once',()=>{
  const q=priceLines(rates.filter(r=>r.collectionPoint==='GATE_IN'),booking,'GATE_IN',settings,new Date(),[id('c')]);
  assert.equal(q.lines.filter(r=>r.description==='Documentation Fee').length,1);
  assert.equal(q.lines.find(r=>r.description==='Documentation Fee').amount,150);
- assert.equal(q.subtotal,1650);assert.equal(q.vat,176.79);assert.equal(q.total,1650);
+ assert.equal(q.subtotal,1650);assert.equal(q.vat,198);assert.equal(q.total,1848);
  assert.equal(q.lines.find(r=>r.description==='Documentation Fee').isOptional,true);
 });
 test('Gate-out includes fixed Storage and Lift Off; not Gate-in shifting or documentation',()=>{
@@ -55,7 +55,7 @@ test('Other service may be selected manually at Gate-out with its server rate',(
  assert.equal(getOptionalRateChoices(gateRates,booking).length,1);
  const q=priceLines(gateRates,booking,'GATE_OUT',settings,new Date(),[id('4')]);
  assert.equal(q.lines.find(r=>r.description==='Container sweeping').amount,85);
- assert.equal(q.total,1305); // VAT is included, not added
+ assert.equal(q.total,1461.6); // PHP 1,305 base + PHP 156.60 VAT
 });
 test('Optional fee selection rejects inapplicable, cross-point, or repeated IDs',()=>{
  assert.throws(()=>priceLines(rates.filter(r=>r.collectionPoint==='GATE_OUT'),booking,'GATE_OUT',settings,new Date(),[id('c')]),/not active or does not apply/);
@@ -75,8 +75,14 @@ test('Overtime on/off and fallback fee work for both collections',()=>{
  const day=priceLines(onlyHandling,{...booking,scheduledGateTimeIn:'08:00'},'GATE_IN',settings);
  assert.equal(day.lines.some(r=>r.description==='Overtime'),false);
 });
-test('Invoice VAT can preserve inclusive/exempt treatment with optional services',()=>{
+test('Invoice VAT adds tax only to taxable optional services',()=>{
  const lines=[{amount:112,taxTreatment:'TAXABLE'},{amount:50,taxTreatment:'EXEMPT'},{amount:0,taxTreatment:'ZERO_RATED'}];
- const q=totalsForLines(lines,12,true);
+ const q=totalsForLines(lines,12);
+ assert.equal(q.subtotal,162);assert.equal(q.vat,13.44);assert.equal(q.total,175.44);
+ assert.equal(q.vatableSales,112);assert.equal(q.nonVatableSales,50);
+});
+test('Legacy inclusive invoice tax breakdown stays available for already issued invoices',()=>{
+ const q=totalsForLines([{amount:112,taxTreatment:'TAXABLE'},{amount:50,taxTreatment:'EXEMPT'}],12,true);
  assert.equal(q.subtotal,162);assert.equal(q.vat,12);assert.equal(q.total,162);
+ assert.equal(q.vatableSales,100);
 });
