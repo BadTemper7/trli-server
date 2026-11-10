@@ -1,3 +1,7 @@
+import { listActiveInventory, inventoryItemView } from '../services/inventoryService.js';
+import HistoricalContainer from '../models/HistoricalContainer.js';
+import { ACTIVE_HISTORICAL, getStoredOccupancy } from '../services/storageAssignmentService.js';
+import { clearStorageClaim } from '../services/storageAssignmentService.js';
 import PreAdvice from '../models/PreAdvice.js';
 import Rate from '../models/Rate.js';
 import PaymentType from '../models/PaymentType.js';
@@ -62,7 +66,8 @@ async function emitStorageOccupancy(blockId) {
   if (!blockId) return;
   const block = await StorageBlock.findById(blockId).lean();
   if (!block) return;
-  const occupied = await PreAdvice.countDocuments({ 'storage.block': blockId, 'storage.status': 'STORED' });
+  // Include imported containers when publishing storage capacity to the admin UI.
+  const occupied = (await getStoredOccupancy([blockId])).get(String(blockId))?.count || 0;
   const capacity = Number(block.capacityTeu || 0);
   emitToAdminModule(MODULES.STORAGE_MONITORING, 'storage:occupancy-updated', {
     id: String(block._id), name: block.name, capacityTeu: capacity, containerSize: block.containerSize,
@@ -479,17 +484,16 @@ export const processGateIn = asyncHandler(async (req,res) => {
     });
   }finally{await session.endSession();}
   const item=await findItem(id);
-  await auditAdminAction({performedBy:req.admin._id,action:'CONTAINER_GATED_IN',changes:{bookingReference:item.bookingReference,inspectionAccepted:true}});
+  await auditAdminAction({performedBy:req.admin._id,action:'CONTAINER_GATED_IN',changes:{module:'GATE_IN',bookingReference:item.bookingReference,containerNumber:item.containerNumber,gateInAt:item.gateIn?.actualGateInAt,inspectionAccepted:true}});
   const data=await notifyWorkflow(item,MODULES.GATE_IN,'gate-in:completed','Container Gated In',`${item.containerNumber} passed inspection and entered the terminal.`);
   emitToAdminModule(MODULES.INVENTORY,'inventory:updated',data);
   emitToAdminModule(MODULES.STORAGE_MONITORING,'storage:waiting-updated',data);
   res.json({success:true,message:'Inspection accepted and physical Gate-in confirmed; container added to inventory.',data});
 });
 
-export const listInventory = asyncHandler(async (req, res) => {
-  const filter = buildOperationFilter(req.query, 'inventory');
-  const { rows, pagination } = await listItems(filter, req.query);
-  res.json({ success: true, message: 'Inventory loaded.', data: { items: rows.map((row) => itemDto(row)), pagination } });
+export const listInventory = asyncHandler(async(req,res)=>{
+  const {items,pagination}=await listActiveInventory(req.query);
+  res.json({success:true,message:'Active live and historical inventory loaded.',data:{items,pagination}});
 });
 
 export const updateInventory = asyncHandler(async (req, res) => {
@@ -507,6 +511,38 @@ export const updateInventory = asyncHandler(async (req, res) => {
   await auditAdminAction({ performedBy: req.admin._id, action: 'INVENTORY_UPDATED', changes: { bookingReference: item.bookingReference, condition: item.inventory.condition, sealNumber: item.inventory.sealNumber } });
   const data = await notifyWorkflow(item, MODULES.INVENTORY, 'inventory:updated');
   res.json({ success: true, message: 'Inventory record updated.', data });
+});
+
+/** Additive source-aware route: the legacy /inventory/:id still updates live bookings. */
+export const updateInventoryBySource = asyncHandler(async(req,res,next) => {
+  const source=String(req.params.source||'').toUpperCase();
+  if(source==='LIVE')return updateInventory(req,res,next);
+  if(source!=='HISTORICAL')throw new AppError('Inventory source must be LIVE or HISTORICAL.',400);
+  const item=await HistoricalContainer.findOne({
+    _id:req.params.id, deletedAt:null, status:{$in:ACTIVE_HISTORICAL},
+    'gateIn.actualGateInAt':{$ne:null},'gateOut.releasedAt':null,
+  });
+  if(!item)throw new AppError('Active historical inventory record not found.',404);
+  const allowed=['GOOD','DENTED','RUST','HOLE','DOOR DAMAGE','OTHER','DAMAGED','FOR_INSPECTION'];
+  const raw=Array.isArray(req.body?.condition)?req.body.condition:req.body?.condition?[req.body.condition]:[];
+  const condition=[...new Set(raw.map(x=>String(x||'').trim().toUpperCase()).filter(Boolean))];
+  if(condition.some(x=>!allowed.includes(x))||(condition.includes('GOOD')&&condition.length>1))throw new AppError('Invalid inventory condition selection.',400);
+  const before={condition:[...(item.inventory?.condition||[])],sealNumber:item.inventory?.sealNumber||item.sealNumber||'',notes:item.inventory?.notes||''};
+  if(req.body?.condition!==undefined)item.inventory.condition=condition;
+  if(req.body?.sealNumber!==undefined)item.inventory.sealNumber=String(req.body.sealNumber||'').trim().slice(0,120);
+  if(req.body?.notes!==undefined)item.inventory.notes=String(req.body.notes||'').trim().slice(0,1000);
+  item.inventory.receivedAt=item.gateIn.actualGateInAt;
+  item.inventory.status=item.storage?.block?'IN_STORAGE':'IN_YARD';
+  item.updatedBy=req.admin._id;
+  const after={condition:item.inventory.condition,sealNumber:item.inventory.sealNumber,notes:item.inventory.notes};
+  item.history.push({action:'INVENTORY_UPDATED',performedBy:req.admin._id,before,after});
+  await item.save();
+  await auditAdminAction({performedBy:req.admin._id,action:'INVENTORY_UPDATED',changes:{module:'INVENTORY',source:'HISTORICAL',containerNumber:item.containerNumber,containerId:String(item._id),before,after}});
+  await item.populate('company','companyName');await item.populate('storage.block','name');
+  const data=inventoryItemView(item.toObject(),'HISTORICAL');
+  clearSummaryCache();
+  emitToAdminModule(MODULES.INVENTORY,'inventory:updated',{id:String(item._id),source:'HISTORICAL'});
+  res.json({success:true,message:'Historical inventory condition updated and audited.',data});
 });
 
 export const listGateOut = asyncHandler(async (req, res) => {
@@ -624,12 +660,13 @@ export const releaseContainer = asyncHandler(async (req,res) => {
       item.gateOut.remarks=String(req.body?.remarks||item.gateOut.remarks||'').slice(0,500);
       item.inventory.status='RELEASED';item.storage.status='RELEASED';
       item.storage.block=null;item.storage.bay=null;item.storage.row=null;item.storage.tier=null;
+      await clearStorageClaim({source:'LIVE',containerId:item._id,session});
       item.status='COMPLETED';item.statusHistory.push({status:'COMPLETED',changedAt:now,note:'Container physically released'});
       advanceWorkflow(item,'CONTAINER_RELEASED',{changedAt:now,note:'Physical release confirmed'});
       await item.save({session});
       if(oldStorage?.block)await StorageMovement.create([{container:item._id,action:'REMOVED',from:oldStorage,performedBy:adminId(req),performedAt:now}],{session});
       await enqueueBookingMail(item,{event:'CONTAINER_RELEASED',title:'Container released',message:`Your container was physically released on ${now.toLocaleString('en-PH',{timeZone:'Asia/Manila'})}.`},session);
-      await auditAdminAction({performedBy:req.admin._id,action:'CONTAINER_RELEASED',changes:{bookingReference:item.bookingReference,containerNumber:item.containerNumber},session});
+      await auditAdminAction({performedBy:req.admin._id,action:'CONTAINER_RELEASED',changes:{module:'GATE_OUT',bookingReference:item.bookingReference,containerNumber:item.containerNumber,releasedAt:now,gateInAt:item.gateIn.actualGateInAt,storageDurationDays:item.gateOut.finalDaysInTerminal,remarks:item.gateOut.remarks},session});
       id=item._id;
     });
   }finally{await session.endSession();}

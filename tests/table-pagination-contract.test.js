@@ -146,7 +146,7 @@ test('summary routes use indexed $match before $group, not rows.length',()=>{
 });
 test('additive indexes and source routes have summary before document routes',()=>{
   const migration=read('../scripts/setupTableIndexes.js');
-  assert.match(migration,/createIndexes\(\)/);
+  assert.match(migration,/model\.collection\.createIndex\(index\.key/);
   assert.doesNotMatch(migration,/dropIndex|syncIndexes/);
   const routes=read('../src/routes/invoiceRoutes.js');
   assert.ok(routes.indexOf("clientInvoices.get('/summary'") < routes.indexOf("clientInvoices.get('/:id'"));

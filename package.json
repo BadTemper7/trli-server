@@ -27,7 +27,8 @@
     "migrate:table-indexes": "node scripts/setupTableIndexes.js",
     "explain:tables": "node scripts/explainTableQueries.js",
     "benchmark:tables": "node scripts/benchmarkTableQueries.js",
-    "migrate:vat-exclusive": "node scripts/migrateVatExclusive.js"
+    "migrate:vat-exclusive": "node scripts/migrateVatExclusive.js",
+    "migrate:storage-claims": "node scripts/migrateStorageClaims.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",

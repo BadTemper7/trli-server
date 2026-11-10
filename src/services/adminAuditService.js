@@ -1,14 +1,8 @@
 import AdminAuditLog from '../models/AdminAuditLog.js';
-
-const blockedKeys = new Set(['password','confirmPassword','passwordHash','temporaryPassword','oldPassword']);
-function sanitize(value) {
-  if (!value || typeof value !== 'object') return value;
-  if (Array.isArray(value)) return value.map(sanitize);
-  return Object.fromEntries(Object.entries(value).filter(([k]) => !blockedKeys.has(k)).map(([k,v]) => [k, sanitize(v)]));
-}
+import { safeAuditValue } from '../utils/auditSanitizer.js';
 
 export async function auditAdminAction({ performedBy = null, targetUser = null, action, changes = {}, session = null }) {
-  const record = { performedBy, targetUser, action, changes: sanitize(changes) };
+  const record = { performedBy, targetUser, action, changes: safeAuditValue(changes) };
   if (session) return (await AdminAuditLog.create([record], { session }))[0];
   return AdminAuditLog.create(record);
 }

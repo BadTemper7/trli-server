@@ -7,6 +7,7 @@ import { getInvoiceSummary } from '../services/tableSummaries.js';
 import { listDocuments } from '../utils/tableQuery.js';
 import { clearSummaryCache } from '../utils/summaryCache.js';
 import PaymentSubmission from '../models/PaymentSubmission.js';
+import ManualFinancialEntry from '../models/ManualFinancialEntry.js';
 import {getReceivingMethod,receivingAccountSnapshot} from '../services/paymentMethods.js';
 import PreAdvice from '../models/PreAdvice.js';
 import { buildInvoice } from '../services/invoicingService.js';
@@ -60,7 +61,8 @@ export const getAdminInvoice = asyncHandler(async (req, res) => {
   const invoice=await Invoice.findById(req.params.id).lean();
   if(!invoice)throw new AppError('Invoice not found.',404);
   const payments=await PaymentSubmission.find({invoice:invoice._id}).sort({createdAt:-1}).lean();
-  res.json({success:true,data:{invoice,payments}});
+  const entries=await ManualFinancialEntry.find({invoice:invoice._id}).populate('recordedBy','name username').sort({createdAt:-1}).lean();
+  res.json({success:true,data:{invoice,payments,entries}});
 });
 export const ensureClientInvoice = asyncHandler(async (req,res) => {
   const booking=await PreAdvice.findOne({_id:req.params.id,company:owner(req)});
@@ -87,20 +89,20 @@ export const submitProof = asyncHandler(async (req,res) => {
     let payment,invoice,bookingReference;
     try{
       await session.withTransaction(async()=>{
-        invoice=await Invoice.findOne({_id:req.params.id,company:owner(req),type:'GATE_IN',status:'UNPAID'}).session(session);
+        invoice=await Invoice.findOne({_id:req.params.id,company:owner(req),type:'GATE_IN',status:{$in:['UNPAID','PARTIALLY_PAID']}}).session(session);
         if(!invoice)throw new AppError('Gate-in invoice is not available for payment.',409);
         const booking=await PreAdvice.findOne({_id:invoice.booking,company:owner(req)}).session(session);
         if(!booking||!['READY_FOR_GATE_IN','GATE_IN_PAYMENT_SUBMITTED'].includes(booking.workflowStage))throw new AppError('Booking is not eligible for gate-in payment.',409);
         bookingReference=booking.bookingReference;
         const amount=Number(req.body.amount);
-        if(!Number.isFinite(amount)||Math.abs(amount-invoice.total)>0.001)throw new AppError('Payment amount must match the invoice.',400);
+        if(!Number.isFinite(amount)||Math.abs(amount-invoice.balance)>0.001)throw new AppError('Payment amount must match the invoice.',400);
         payment=(await PaymentSubmission.create([{
           invoice:invoice._id,company:invoice.company,booking:invoice.booking,method,reference,amount,receivingAccount:receivingAccountSnapshot(receivingMethod),
           proof:proof?{storedName:proof.filename,name:proof.originalname,mimeType:proof.mimetype,size:proof.size}:undefined,submittedBy:req.user._id,
           status:'PENDING_VERIFICATION',
         }],{session}))[0];
         invoice.status='PAYMENT_SUBMITTED';await invoice.save({session});
-        booking.gateIn.payment.status='SUBMITTED';booking.gateIn.payment.amountDue=invoice.total;
+        booking.gateIn.payment.status='SUBMITTED';booking.gateIn.payment.amountDue=invoice.balance;
         booking.gateIn.payment.amountSubmitted=amount;booking.gateIn.payment.method=method;
         booking.gateIn.payment.referenceNumber=reference;booking.gateIn.payment.submittedAt=new Date();
         advanceWorkflow(booking,'GATE_IN_PAYMENT_SUBMITTED',{note:'Online gate-in payment evidence submitted for verification'});
@@ -151,21 +153,25 @@ export const reviewPayment = asyncHandler(async (req,res) => {
       if(!booking||!['READY_FOR_GATE_IN','GATE_IN_PAYMENT_SUBMITTED'].includes(booking.workflowStage))throw new AppError('Booking is no longer waiting for Gate-in payment verification.',409);
       if(!booking.gateIn?.payment)throw new AppError('Booking does not have a Gate-in payment state. Contact technical support.',409);
       if(decision==='APPROVE') {
-        if(!Number.isFinite(Number(payment.amount)) || Math.abs(Number(payment.amount)-Number(invoice.total))>0.001)throw new AppError('Payment amount does not match the invoice total.',409);
+        if(!Number.isFinite(Number(payment.amount)) || Math.abs(Number(payment.amount)-Number(invoice.balance))>0.001)throw new AppError('Payment amount does not match the invoice total.',409);
         payment.receiptNumber=await uniqueReceiptNumber(session);
         payment.status='VERIFIED';
-        invoice.status='PAID';invoice.paidAmount=invoice.total;invoice.balance=0;invoice.paidAt=new Date();invoice.verifiedBy=req.admin._id;
+        invoice.paidAmount=Math.round((Number(invoice.paidAmount||0)+Number(payment.amount))*100)/100;
+        invoice.balance=Math.round((invoice.total-invoice.paidAmount)*100)/100;
+        invoice.status=invoice.balance===0?'PAID':'PARTIALLY_PAID';
+        if(invoice.status==='PAID')invoice.paidAt=new Date();
+        invoice.verifiedBy=req.admin._id;
         booking.gateIn.payment.status='VERIFIED';
       } else {
         payment.status='REJECTED';payment.rejectionReason=reason;
-        invoice.status='UNPAID';booking.gateIn.payment.status='REJECTED';
+        invoice.status=Number(invoice.paidAmount||0)>0?'PARTIALLY_PAID':'UNPAID';booking.gateIn.payment.status='REJECTED';
       }
       payment.verifiedBy=req.admin._id;payment.verifiedAt=new Date();
       await payment.save({session});await invoice.save({session});await booking.save({session});
       // Audit lives in the SAME commit. An audit failure cannot turn an already
       // verified payment into an HTTP 500 or leave an untracked approval.
       await auditAdminAction({performedBy:req.admin._id,action:decision==='APPROVE'?'PAYMENT_VERIFIED':'PAYMENT_REJECTED',
-        changes:{invoice:invoice.number,paymentId:String(payment._id),reference:payment.reference,reason},session});
+        changes:{module:'PAYMENT_HISTORY',invoice:invoice.number,paymentId:String(payment._id),bookingReference:booking.bookingReference,amount:payment.amount,method:payment.method,reference:payment.reference,receiptNumber:payment.receiptNumber||'',reason,before:{paymentStatus:'PENDING_VERIFICATION'},after:{paymentStatus:payment.status,invoiceStatus:invoice.status,paidAmount:invoice.paidAmount,balance:invoice.balance}},session});
     });
       break;
     } catch (error) {

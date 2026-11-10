@@ -3,7 +3,7 @@ import { booleanParam, dateRange, enumParam, objectIdParam, prefixSearch, scalar
 
 export const BOOKING_STATUSES = ['DRAFT', 'SUBMITTED', 'REJECTED', 'SCHEDULED', 'READY_FOR_GATE_IN', 'GATED_IN', 'COMPLETED', 'CANCELLED'];
 export const WORKFLOW_STAGES = ['BOOKING_SUBMITTED', 'BOOKING_APPROVED', 'READY_FOR_GATE_IN', 'GATE_IN_PAYMENT_SUBMITTED', 'GATE_IN', 'INVENTORY', 'STORAGE', 'GATE_OUT_REQUESTED', 'GATE_OUT_PAYMENT_PENDING', 'GATE_OUT_PAYMENT_SUBMITTED', 'GATE_OUT_APPROVED', 'READY_FOR_RELEASE', 'CONTAINER_RELEASED'];
-export const INVOICE_STATUSES = ['UNPAID', 'PAYMENT_SUBMITTED', 'PAID', 'CANCELLED', 'VOID'];
+export const INVOICE_STATUSES = ['UNPAID', 'PARTIALLY_PAID', 'PAYMENT_SUBMITTED', 'PAID', 'CANCELLED', 'VOID'];
 const BOOKING_CATEGORIES = ['ALL', 'GATE_IN_PAYMENT', 'REQUESTABLE_GATE_OUT', 'GATE_OUT_PAYMENT'];
 const TRACKING_STATUSES = ['UNKNOWN', 'BOOKED', 'GATED_IN', 'STORED', 'GATE_OUT_APPROVED', 'RELEASED', 'CANCELLED'];
 
@@ -55,7 +55,7 @@ export function buildOperationFilter(query, kind) {
     if (approval === 'REJECTED') filter.$and.push({ status: 'REJECTED' });
   } else if (kind === 'gate-in' || kind === 'gate-out' || kind === 'release') {
     const stages = kind === 'gate-in' ? ['READY_FOR_GATE_IN', 'GATE_IN_PAYMENT_SUBMITTED']
-      : kind === 'gate-out' ? ['GATE_OUT_PAYMENT_SUBMITTED'] : ['READY_FOR_RELEASE'];
+      : kind === 'gate-out' ? ['GATE_OUT_PAYMENT_PENDING','GATE_OUT_PAYMENT_SUBMITTED'] : ['READY_FOR_RELEASE'];
     filter.workflowStage = stage ? (stages.includes(stage) ? stage : { $in: [] }) : { $in: stages };
     if (kind === 'gate-in') {
       const queue = enumParam(query, 'queue', ['ALL', 'PAYMENT', 'READY', 'REJECTED'], 'ALL');

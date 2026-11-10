@@ -7,7 +7,7 @@ import { MODULES, ACTIONS } from '../constants/permissions.js';
 import {
   listAdminPreAdvice, getAdminPreAdvice, approvePreAdvice, rejectPreAdvice,
   listGateIn, inspectGateIn, submitGateInPayment, cancelGateInPayment, processGateIn,
-  listInventory, updateInventory,
+  listInventory, updateInventory, updateInventoryBySource,
   listGateOut, requestGateOut, submitGateOutPayment, approveGateOut,
   listRelease, releaseContainer, operationSummary,
 } from '../controllers/operationsController.js';
@@ -32,6 +32,7 @@ router.post('/gate-in/:id/process', validateId(), requirePermission(MODULES.GATE
 
 router.get('/inventory', requirePermission(MODULES.INVENTORY, ACTIONS.VIEW), listInventory);
 router.get('/inventory/summary', requirePermission(MODULES.INVENTORY, ACTIONS.VIEW), (req,res,next)=>{req.params.resource='inventory';return operationSummary(req,res,next);});
+router.put('/inventory/:source/:id', validateId(), requirePermission(MODULES.INVENTORY, ACTIONS.EDIT), updateInventoryBySource);
 router.put('/inventory/:id', validateId(), requirePermission(MODULES.INVENTORY, ACTIONS.EDIT), updateInventory);
 
 router.get('/gate-out', requirePermission(MODULES.GATE_OUT, ACTIONS.VIEW), listGateOut);

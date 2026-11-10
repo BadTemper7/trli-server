@@ -6,7 +6,7 @@ const read = (path) => fs.readFileSync(new URL(path, import.meta.url), 'utf8');
 
 test('table index migration verifies actual MongoDB indexes without dropping indexes or data', () => {
   const source = read('../scripts/setupTableIndexes.js');
-  assert.match(source, /model\.createIndexes\(\)/);
+  assert.match(source, /model\.collection\.createIndex\(index\.key,\{name:index\.name\}\)/);
   assert.match(source, /model\.collection\.listIndexes\(\)\.toArray\(\)/);
   assert.match(source, /missing\.length/);
   assert.match(source, /NamespaceNotFound/);

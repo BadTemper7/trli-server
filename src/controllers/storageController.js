@@ -2,9 +2,12 @@ import mongoose from 'mongoose';
 import PreAdvice from '../models/PreAdvice.js';
 import StorageBlock from '../models/StorageBlock.js';
 import StorageMovement from '../models/StorageMovement.js';
+import HistoricalContainer from '../models/HistoricalContainer.js';
+import { getStoredOccupancy, availableStorageSlots, assignStorageClaim, clearStorageClaim, occupiedPositions } from '../services/storageAssignmentService.js';
 import { getIO, emitToAdminModule } from '../socket/index.js';
 import { MODULES } from '../constants/permissions.js';
 import { AppError, asyncHandler } from '../utils/http.js';
+import { auditAdminAction } from '../services/adminAuditService.js';
 import { advanceWorkflow, ensureWorkflow } from '../utils/preAdviceWorkflow.js';
 import { storageDaysBetween } from '../utils/storageDuration.js';
 
@@ -35,14 +38,7 @@ function cleanBlockInput(body) {
   return { name, capacityTeu, containerSize, status, color, layout: { bays, rows, tiers } };
 }
 
-async function occupancyMap(blockIds = []) {
-  const ids = blockIds.map((id) => new mongoose.Types.ObjectId(id));
-  const rows = await PreAdvice.aggregate([
-    { $match: { 'storage.status': 'STORED', 'storage.block': { $in: ids } } },
-    { $group: { _id: '$storage.block', teu: { $sum: 1 }, count: { $sum: 1 } } },
-  ]);
-  return new Map(rows.map((row) => [String(row._id), { teu: row.teu, count: row.count }]));
-}
+const occupancyMap = getStoredOccupancy;
 
 function blockDto(block, occ = { teu: 0, count: 0 }) {
   const availableTeu = Math.max(0, block.capacityTeu - occ.teu);
@@ -58,7 +54,7 @@ function blockDto(block, occ = { teu: 0, count: 0 }) {
   };
 }
 
-async function emitBlockOccupancy(blockId) {
+export async function emitBlockOccupancy(blockId) {
   const block = await StorageBlock.findById(blockId);
   if (!block) return;
   const map = await occupancyMap([blockId]);
@@ -115,8 +111,8 @@ export const updateBlock = asyncHandler(async (req, res) => {
 export const deleteBlock = asyncHandler(async (req, res) => {
   const block = await StorageBlock.findById(req.params.id);
   if (!block) throw new AppError('Storage block not found.', 404);
-  const assigned = await PreAdvice.exists({ 'storage.block': block._id, 'storage.status': 'STORED' });
-  if (assigned) throw new AppError('This block cannot be deleted while containers are assigned to it.', 409);
+  const assigned = await Promise.all([PreAdvice.exists({ 'storage.block': block._id, 'storage.status': 'STORED', deletedAt:null, 'gateOut.releasedAt':null }), HistoricalContainer.exists({ 'storage.block': block._id, status: { $in: ['GATED_IN', 'STORED', 'GATE_OUT_APPROVED'] }, deletedAt: null, 'gateOut.releasedAt':null })]);
+  if (assigned.some(Boolean)) throw new AppError('This block cannot be deleted while containers are assigned to it.', 409);
   await block.deleteOne();
   emitToAdminModule(MODULES.STORAGE_MONITORING, 'storage:block-deleted', { id: String(block._id) });
   res.json({ success: true, message: 'Storage block deleted.', data: { id: String(block._id) } });
@@ -130,12 +126,23 @@ export const waitingContainers = asyncHandler(async (req, res) => {
   res.json({ success: true, message: 'Waiting containers loaded.', data: containers.map(containerDto) });
 });
 
+export const storageSlots = asyncHandler(async(req, res) => {
+  const data = await availableStorageSlots(req.params.id);
+  res.json({ success: true, data });
+});
+
 export const blockContainers = asyncHandler(async (req, res) => {
   const block = await StorageBlock.findById(req.params.id);
   if (!block) throw new AppError('Storage block not found.', 404);
-  const containers = await PreAdvice.find({ 'storage.block': block._id, 'storage.status': 'STORED' })
-    .populate('company', 'companyName').sort({ 'storage.bay': 1, 'storage.row': 1, 'storage.tier': 1 });
-  res.json({ success: true, message: 'Stored containers loaded.', data: containers.map(containerDto) });
+  const [live, historical] = await Promise.all([
+    PreAdvice.find({ 'storage.block': block._id, 'storage.status': 'STORED',deletedAt:null,'gateOut.releasedAt':null }).populate('company','companyName').sort({ 'storage.bay':1, 'storage.row':1 }),
+    HistoricalContainer.find({ 'storage.block':block._id, status:{ $in:['GATED_IN','STORED','GATE_OUT_APPROVED'] }, deletedAt:null,'gateOut.releasedAt':null }).populate('company','companyName'),
+  ]);
+  const mapped = [...live.map(x => ({ ...containerDto(x), source:'LIVE' })), ...historical.map(x => ({
+    ...x.toObject(), id:String(x._id), source:'HISTORICAL', size:x.containerSize,type:x.containerType,client:x.company?.companyName||'',companyName:x.company?.companyName||'',
+    daysInTerminal:x.gateIn?.actualGateInAt?storageDaysBetween(x.gateIn.actualGateInAt,new Date()):0,
+  }))];
+  res.json({ success:true, message:'Stored containers loaded.', data:mapped });
 });
 
 function containerDto(c) {
@@ -157,62 +164,67 @@ function containerDto(c) {
   };
 }
 
-async function validatePosition(block, container, position, ignoreContainerId = null) {
-  if (!block) throw new AppError('Storage block not found.', 404);
-  if (block.status !== 'ACTIVE') throw new AppError(`Block ${block.name} is ${block.status} and cannot receive containers.`, 409);
-  if (container.containerSize !== block.containerSize) throw new AppError(`This block accepts ${block.containerSize} containers only.`, 409);
-  const bay = Number(position.bay), row = Number(position.row), tier = Number(position.tier);
-  if (![bay, row, tier].every(Number.isInteger)) throw new AppError('Bay, row and tier are required whole numbers.', 400);
-  if (bay < 1 || bay > block.layout.bays || row < 1 || row > block.layout.rows || tier < 1 || tier > block.layout.tiers) throw new AppError('Selected storage position is outside the block layout.', 400);
-  const conflictFilter = { 'storage.block': block._id, 'storage.bay': bay, 'storage.row': row, 'storage.tier': tier, 'storage.status': 'STORED' };
-  if (ignoreContainerId) conflictFilter._id = { $ne: ignoreContainerId };
-  if (await PreAdvice.exists(conflictFilter)) throw new AppError('That storage position is already occupied.', 409);
-  const map = await occupancyMap([block._id]);
-  const used = map.get(String(block._id))?.teu || 0;
-  const incoming = 1;
-  if (used + incoming > block.capacityTeu && String(container.storage?.block || '') !== String(block._id)) throw new AppError('The storage block does not have enough available capacity.', 409);
-  return { bay, row, tier };
-}
 
-export const assignContainer = asyncHandler(async (req, res) => {
-  const block = await StorageBlock.findById(req.params.id);
-  const container = await PreAdvice.findById(req.body.containerId).populate('company', 'companyName');
-  if (!container) throw new AppError('Container record not found.', 404);
-  if (container.status !== 'GATED_IN') throw new AppError('Only gated-in containers can be assigned to storage.', 409);
-  if (container.storage?.status === 'STORED') throw new AppError('Container is already assigned to storage.', 409);
-  const position = await validatePosition(block, container, req.body);
-  const now = new Date();
-  container.storage = { status: 'STORED', block: block._id, ...position, storedAt: now, storedBy: adminId(req) };
-  container.inventory.status = 'IN_STORAGE';
-  ensureWorkflow(container);
-  advanceWorkflow(container, 'STORAGE', { changedAt: now, note: `Stored in ${block.name}` });
-  try { await container.save(); } catch (error) { if (error?.code === 11000) throw new AppError('That storage position was taken by another operator. Choose another position.', 409); throw error; }
-  await container.populate('storage.block', 'name');
-  await StorageMovement.create({ container: container._id, action: 'ASSIGNED', to: { block: block._id, ...position }, performedBy: adminId(req), performedAt: now });
-  const data = containerDto(container);
-  emitToAdminModule(MODULES.STORAGE_MONITORING, 'storage:container-assigned', data);
-  emitToAdminModule(MODULES.GATE_OUT, 'gate-out:queue-invalidated', { id: String(container._id) });
-  getIO()?.to(`company:${container.company?._id || container.company}`).emit('pre-advice:workflow-updated', {
-    id: String(container._id), workflowStage: container.workflowStage, workflowHistory: container.workflowHistory, storage: container.storage, updatedAt: container.updatedAt,
+export const assignContainer = asyncHandler(async(req,res) => {
+  const session = await mongoose.startSession();
+  let container, block, position, now;
+  try {
+    await session.withTransaction(async() => {
+      block = await StorageBlock.findById(req.params.id).session(session);
+      container = await PreAdvice.findById(req.body.containerId).session(session);
+      if (!container) throw new AppError('Container record not found.',404);
+      if (container.status !== 'GATED_IN' || container.gateOut?.releasedAt) throw new AppError('Only gated-in, unreleased containers can enter storage.',409);
+      if (container.storage?.status === 'STORED') throw new AppError('This container already has an assigned storage slot.',409);
+      position = await assignStorageClaim({ blockId:block?._id, position:req.body, containerSize:container.containerSize,
+        source:'LIVE', containerId:container._id, session });
+      now = new Date();
+      container.storage = { status:'STORED',...position,storedAt:now,storedBy:adminId(req) };
+      container.inventory.status = 'IN_STORAGE';
+      ensureWorkflow(container);
+      advanceWorkflow(container,'STORAGE',{ changedAt:now,note:`Stored in ${block.name}` });
+      await container.save({session});
+      await StorageMovement.create([{container:container._id,action:'ASSIGNED',to:position,performedBy:adminId(req),performedAt:now}],{session});
+      await auditAdminAction({performedBy:req.admin._id,action:'STORAGE_ASSIGNED',changes:{module:'STORAGE_MONITORING',containerNumber:container.containerNumber,bookingReference:container.bookingReference,containerId:String(container._id),after:{storage:{blockName:block.name,bay:position.bay,row:position.row,tier:position.tier}}},session});
+    });
+  } finally { await session.endSession(); }
+  await container.populate('company','companyName');
+  await container.populate('storage.block','name');
+  const data=containerDto(container);
+  emitToAdminModule(MODULES.STORAGE_MONITORING,'storage:container-assigned',data);
+  emitToAdminModule(MODULES.INVENTORY,'inventory:updated',data);
+  getIO()?.to(`company:${container.company?._id || container.company}`).emit('pre-advice:workflow-updated',{
+    id:String(container._id),workflowStage:container.workflowStage,workflowHistory:container.workflowHistory,storage:container.storage,updatedAt:container.updatedAt,
   });
   await emitBlockOccupancy(block._id);
-  res.json({ success: true, message: 'Container assigned to storage.', data });
+  res.json({success:true,message:'Container assigned to storage.',data});
 });
 
-export const relocateContainer = asyncHandler(async (req, res) => {
-  const container = await PreAdvice.findById(req.params.containerId).populate('company', 'companyName');
-  if (!container || container.storage?.status !== 'STORED') throw new AppError('Stored container not found.', 404);
-  const destination = await StorageBlock.findById(req.body.blockId);
-  const old = { block: container.storage.block, bay: container.storage.bay, row: container.storage.row, tier: container.storage.tier };
-  const position = await validatePosition(destination, container, req.body, container._id);
-  container.storage = { status: 'STORED', block: destination._id, ...position, storedAt: new Date(), storedBy: adminId(req) };
-  try { await container.save(); } catch (error) { if (error?.code === 11000) throw new AppError('That destination position was taken by another operator.', 409); throw error; }
-  await StorageMovement.create({ container: container._id, action: 'RELOCATED', from: old, to: { block: destination._id, ...position }, performedBy: adminId(req) });
-  const data = containerDto(container);
-  emitToAdminModule(MODULES.STORAGE_MONITORING, 'storage:container-relocated', data);
-  await emitBlockOccupancy(old.block);
-  await emitBlockOccupancy(destination._id);
-  res.json({ success: true, message: 'Container relocated.', data });
+export const relocateContainer = asyncHandler(async(req,res) => {
+  const session=await mongoose.startSession();
+  let container,destination,old,position;
+  try {
+    await session.withTransaction(async() => {
+      container=await PreAdvice.findById(req.params.containerId).session(session);
+      if (!container || container.storage?.status !== 'STORED' || container.gateOut?.releasedAt) throw new AppError('Stored container not found.',404);
+      destination=await StorageBlock.findById(req.body.blockId).session(session);
+      old={block:container.storage.block,bay:container.storage.bay,row:container.storage.row,tier:container.storage.tier};
+      const previousBlock=await StorageBlock.findById(old.block).select('name').session(session).lean();
+      old.blockName=previousBlock?.name||'';
+      position=await assignStorageClaim({blockId:destination?._id,position:req.body,containerSize:container.containerSize,
+        source:'LIVE',containerId:container._id,session});
+      container.storage={ status:'STORED',...position,storedAt:container.storage.storedAt||new Date(),storedBy:adminId(req) };
+      await container.save({session});
+      await StorageMovement.create([{container:container._id,action:'RELOCATED',from:old,to:position,performedBy:adminId(req)}],{session});
+      await auditAdminAction({performedBy:req.admin._id,action:'STORAGE_UPDATED',changes:{module:'STORAGE_MONITORING',containerNumber:container.containerNumber,bookingReference:container.bookingReference,containerId:String(container._id),before:{storage:old},after:{storage:{...position,blockName:destination.name}}},session});
+    });
+  } finally { await session.endSession(); }
+  await container.populate('company','companyName');
+  await container.populate('storage.block','name');
+  const data=containerDto(container);
+  emitToAdminModule(MODULES.STORAGE_MONITORING,'storage:container-relocated',data);
+  emitToAdminModule(MODULES.INVENTORY,'inventory:updated',data);
+  await emitBlockOccupancy(old.block);await emitBlockOccupancy(destination._id);
+  res.json({success:true,message:'Container relocated.',data});
 });
 
 // Staging is an operational flag, not physical release. Do not free the

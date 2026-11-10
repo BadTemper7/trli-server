@@ -1,6 +1,6 @@
 // Additive table-index migration. Does not modify documents or drop indexes.
-// createIndexes() may resolve to undefined in some Mongoose/driver versions;
-// always verify the indexes in MongoDB instead of relying on its return value.
+// Only named performance indexes are created and verified in MongoDB;
+// payment-reference uniqueness and other constraints are never touched.
 import 'dotenv/config';
 import mongoose from 'mongoose';
 import PreAdvice from '../src/models/PreAdvice.js';
@@ -8,12 +8,14 @@ import Invoice from '../src/models/Invoice.js';
 import HistoricalContainer from '../src/models/HistoricalContainer.js';
 import AdminAuditLog from '../src/models/AdminAuditLog.js';
 import Notification from '../src/models/Notification.js';
+import ClientCompany from '../src/models/ClientCompany.js';
+import PaymentSubmission from '../src/models/PaymentSubmission.js';
 
 const uri = process.env.MONGO_URI || process.env.MONGODB_URI;
 if (!uri) throw new Error('MONGO_URI or MONGODB_URI is required');
 
 // Only validate the named indexes owned by the table-pagination upgrade.
-// The call to createIndexes still preserves all other schema-declared indexes.
+// Explicitly create only these named indexes; preserve all unrelated indexes.
 const tableIndexes = (model) => model.schema.indexes()
   .filter(([, options]) => /^idx_/.test(options.name || ''))
   .map(([key, options]) => ({ name: options.name, key }));
@@ -30,10 +32,12 @@ async function listExistingIndexes(model) {
 
 try {
   await mongoose.connect(uri, { autoIndex: false, serverSelectionTimeoutMS: 10_000 });
-  for (const model of [PreAdvice, Invoice, HistoricalContainer, AdminAuditLog, Notification]) {
+  for (const model of [PreAdvice, Invoice, HistoricalContainer, AdminAuditLog, Notification, ClientCompany, PaymentSubmission]) {
     const expected = tableIndexes(model);
     const before = new Set((await listExistingIndexes(model)).map(index => index.name));
-    await model.createIndexes();
+    // Only add the named performance indexes. Never recreate or alter existing
+    // financial uniqueness indexes (they have their own audited migration).
+    for (const index of expected) await model.collection.createIndex(index.key,{name:index.name});
     const actual = await listExistingIndexes(model);
     const byName = new Map(actual.map(index => [index.name, index]));
     const missing = expected.filter(index => !byName.has(index.name) || !matchesKeys(byName.get(index.name).key, index.key));

@@ -93,10 +93,11 @@ export const updatePaymentType = asyncHandler(async (req, res) => {
     const duplicate = await PaymentType.exists({ code: input.code, _id: { $ne: row._id } });
     if (duplicate) throw new AppError('This payment type already exists.', 409);
   }
+  const before = dto(row);
   Object.assign(row, input, { updatedBy: req.admin._id });
   await row.save();
   const data = dto(row);
-  await auditAdminAction({ performedBy: req.admin._id, action: 'PAYMENT_TYPE_UPDATED', changes: { code: row.code, name: row.name, status: row.status, requiresReference: row.requiresReference, bankName: row.bankName, accountName: row.accountName } });
+  await auditAdminAction({ performedBy: req.admin._id, action: 'PAYMENT_TYPE_UPDATED', changes: { module: 'PAYMENT_TYPES', before, after:data } });
   emitToAdminModule(MODULES.PAYMENT_TYPES, 'payment-type:updated', data);
   res.json({ success: true, message: 'Payment type updated.', data });
 });

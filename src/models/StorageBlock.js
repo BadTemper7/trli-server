@@ -11,6 +11,7 @@ const schema = new mongoose.Schema({
     rows: { type: Number, required: true, min: 1, max: 20 },
     tiers: { type: Number, required: true, min: 1, max: 10 },
   },
+  occupancyRevision: { type: Number, default: 0 },
   createdBy: { type: String, default: 'external-admin' },
   updatedBy: { type: String, default: 'external-admin' },
 }, { timestamps: true });

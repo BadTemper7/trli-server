@@ -3,6 +3,8 @@ import path from 'node:path';
 import mongoose from 'mongoose';
 import PreAdvice from '../models/PreAdvice.js';
 import HistoricalContainer from '../models/HistoricalContainer.js';
+import StorageSlotClaim from '../models/StorageSlotClaim.js';
+import ManualFinancialEntry from '../models/ManualFinancialEntry.js';
 import ForwardingContainer from '../models/ForwardingContainer.js';
 import Invoice from '../models/Invoice.js';
 import PaymentSubmission from '../models/PaymentSubmission.js';
@@ -22,6 +24,7 @@ import AdminAuditLog from '../models/AdminAuditLog.js';
 import { MODULES, ACTIONS } from '../constants/permissions.js';
 import {hasPermission} from '../middleware/requirePermission.js';
 import {auditAdminAction} from '../services/adminAuditService.js';
+import {safeAuditValue} from '../utils/auditSanitizer.js';
 import {AppError,asyncHandler} from '../utils/http.js';
 import { dateRange, scalar, listDocuments } from '../utils/tableQuery.js';
 import { clearSummaryCache } from '../utils/summaryCache.js';
@@ -70,10 +73,9 @@ function requireFinancialAcknowledgement(req, financial) {
 const escapeRegex = s => String(s).replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
 
 async function preflightBookings(ids,req,session) {
-  const [bookings,invoices] = await Promise.all([
-    PreAdvice.find({_id:{$in:ids}}).select('_id bookingReference containerNumber status company documents').session(session).lean(),
-    Invoice.find({booking:{$in:ids}}).select('_id number status total paidAmount booking').session(session).lean(),
-  ]);
+  // MongoDB transactions cannot run parallel operations on one session.
+  const bookings=await PreAdvice.find({_id:{$in:ids}}).select('_id bookingReference containerNumber status company documents').session(session).lean();
+  const invoices=await Invoice.find({booking:{$in:ids}}).select('_id number status total paidAmount booking').session(session).lean();
   if (bookings.length!==ids.length) throw new AppError('Some selected bookings no longer exist. Refresh your list.',409);
   const invoiceIds = invoices.map(x=>x._id);
   const payments = await PaymentSubmission.find({$or:[
@@ -90,6 +92,8 @@ async function purgeBookings(ids,req,session,files) {
   await PaymentSubmission.deleteMany({$or:[{booking:{$in:ids}}, ...(invoiceIds.length?[{invoice:{$in:invoiceIds}}]:[])]},{session});
   await Invoice.deleteMany({booking:{$in:ids}},{session});
   await StorageMovement.deleteMany({container:{$in:ids}},{session});
+  await StorageSlotClaim.deleteMany({source:'LIVE',container:{$in:ids}},{session});
+  await ManualFinancialEntry.deleteMany({booking:{$in:ids}},{session});
   await BookingSlot.updateMany({bookings:{$in:ids}},{$pull:{bookings:{$in:ids}}},{session});
   // Leave the hourly reservation rows in place: their unique day/hour index is
   // reusable, and the empty booking list no longer consumes capacity.
@@ -107,7 +111,7 @@ async function purgeBookings(ids,req,session,files) {
   return {count:ids.length,financial:plan.payments.filter(p=>p.status==='VERIFIED').length,
     removedInvoices:plan.invoices.map(x=>({number:x.number,total:x.total,paidAmount:x.paidAmount,status:x.status})),
     removedPayments:plan.payments.map(p=>({invoice:String(p.invoice||''),status:p.status,receiptNumber:p.receiptNumber,method:p.method,reference:p.reference,amount:p.amount,verifiedAt:p.verifiedAt})),
-    bookings:plan.bookings.map(x=>({reference:x.bookingReference,container:x.containerNumber}))};
+    bookings:plan.bookings.map(x=>({id:String(x._id),reference:x.bookingReference,container:x.containerNumber,status:x.status,recordType:'Live Container'}))};
 }
 
 async function executeDelete(req,parsed,session,files) {
@@ -119,7 +123,7 @@ async function executeDelete(req,parsed,session,files) {
     const historical=objects(parsed.ids.filter(x=>x.source==='historical').map(x=>x.id));
     let summary={count:0,financial:0};
     if(live.length){const result=await purgeBookings(live,req,session,files);summary={...result,count:result.count};}
-    if(historical.length){const docs=await HistoricalContainer.find({_id:{$in:historical}}).select('_id containerNumber status').session(session).lean();if(docs.length!==historical.length)throw new AppError('Some selected historical records no longer exist.',409);const deleted=await HistoricalContainer.deleteMany({_id:{$in:historical}},{session});summary.count+=deleted.deletedCount;summary.historical=docs.map(x=>({id:String(x._id),container:x.containerNumber,status:x.status}));}
+    if(historical.length){const docs=await HistoricalContainer.find({_id:{$in:historical}}).select('_id containerNumber status').session(session).lean();if(docs.length!==historical.length)throw new AppError('Some selected historical records no longer exist.',409);await StorageSlotClaim.deleteMany({source:'HISTORICAL',container:{$in:historical}},{session});const deleted=await HistoricalContainer.deleteMany({_id:{$in:historical}},{session});summary.count+=deleted.deletedCount;summary.historical=docs.map(x=>({id:String(x._id),container:x.containerNumber,status:x.status,recordType:'Historical Container'}));}
     return summary;
   }
   if(module==='CLIENT_VERIFICATION') {
@@ -128,6 +132,8 @@ async function executeDelete(req,parsed,session,files) {
     const bookings=await PreAdvice.find({company:{$in:ids}}).select('_id').session(session).lean();
     const bResult=await purgeBookings(bookings.map(x=>x._id),req,session,files);
     const clients=await ClientUser.find({company:{$in:ids}}).select('_id email').session(session).lean();
+    const imported=await HistoricalContainer.find({company:{$in:ids}}).select('_id').session(session).lean();
+    if(imported.length)await StorageSlotClaim.deleteMany({source:'HISTORICAL',container:{$in:imported.map(x=>x._id)}},{session});
     await HistoricalContainer.deleteMany({company:{$in:ids}},{session});
     await VerificationHistory.deleteMany({company:{$in:ids}},{session});
     await Notification.deleteMany({$or:[{company:{$in:ids}},{user:{$in:clients.map(x=>x._id)}}]},{session});
@@ -142,8 +148,10 @@ async function executeDelete(req,parsed,session,files) {
     const r=await ForwardingContainer.deleteMany({_id:{$in:ids}},{session});return {count:r.deletedCount,containers:docs.map(x=>({number:x.containerNumber,status:x.status}))};
   }
   if(module==='STORAGE_MONITORING') {
-    const used=await PreAdvice.exists({'storage.block':{$in:ids},deletedAt:null}).session(session);
-    if(used)throw new AppError('Delete or relocate the containers assigned to these blocks before deleting storage blocks.',409);
+    const used=await PreAdvice.exists({'storage.block':{$in:ids},'storage.status':'STORED',deletedAt:null,'gateOut.releasedAt':null}).session(session);
+    const historicalUsed=await HistoricalContainer.exists({'storage.block':{$in:ids},status:{$in:['GATED_IN','STORED','GATE_OUT_APPROVED']},deletedAt:null,'gateOut.releasedAt':null}).session(session);
+    const claimed=await StorageSlotClaim.exists({block:{$in:ids}}).session(session);
+    if(used||historicalUsed||claimed)throw new AppError('Delete or relocate the containers assigned to these blocks before deleting storage blocks.',409);
     const docs=await StorageBlock.find({_id:{$in:ids}}).session(session).lean();if(docs.length!==ids.length)throw new AppError('Some storage blocks no longer exist.',409);
     await StorageBlock.deleteMany({_id:{$in:ids}},{session});return {count:ids.length,blocks:docs.map(x=>x.name)};
   }
@@ -219,7 +227,25 @@ export const deleteRecords=asyncHandler(async(req,res)=>{
   try {
     await session.withTransaction(async()=>{
       result=await executeDelete(req,parsed,session,files);
-      await auditAdminAction({performedBy:req.admin._id,action:parsed.ids.length>1?'RECORDS_BULK_DELETED':'RECORD_DELETED',changes:{module:parsed.module,target:parsed.target,ids:parsed.ids.map(x=>x.source?`${x.source}:${x.id}`:x.id),reason:parsed.reason,result},session});
+      // Save meaningful identity/status snapshots in the same transaction.
+      // Deleted documents cannot be looked up when the audit is viewed later.
+      const records=[
+        ...(result.bookings||[]).map(x=>({recordId:x.id,containerNumber:x.container,bookingReference:x.reference,recordType:x.recordType||'Live Container',previousStatus:x.status,result:'Deleted'})),
+        ...(result.historical||[]).map(x=>({recordId:x.id,containerNumber:x.container,recordType:'Historical Container',previousStatus:x.status,result:'Deleted'})),
+        ...(result.containers||[]).map(x=>({containerNumber:x.number,recordType:'Forwarding Container',previousStatus:x.status,result:'Deleted'})),
+        ...(result.rates||[]).map(x=>({recordName:x.name,recordType:'Rate',previousStatus:'Configured',result:'Deleted'})),
+        ...(result.users||[]).map(x=>({recordName:x.email,recordType:'Administrator',result:'Deleted'})),
+        ...(result.companies||[]).map(x=>({recordName:x,recordType:'Client',result:'Deleted'})),
+        ...(result.blocks||[]).map(x=>({recordName:x,recordType:'Storage Block',result:'Deleted'})),
+        ...(result.removedInvoices||[]).map(x=>({recordName:x.number,recordType:'Invoice',previousStatus:x.status,result:'Deleted'})),
+        ...(result.removedPayments||[]).map(x=>({recordName:x.receiptNumber||x.reference||'Payment',recordType:'Payment',previousStatus:x.status,result:'Deleted'})),
+      ];
+      const deletionSummary={totalRecordsDeleted:result.count||0,historicalRecordsDeleted:(result.historical||[]).length,
+        financialRecordsDeleted:(result.removedInvoices||[]).length+(result.removedPayments||[]).length,
+        invoicesDeleted:(result.removedInvoices||[]).length,paymentsDeleted:(result.removedPayments||[]).length};
+      await auditAdminAction({performedBy:req.admin._id,action:parsed.ids.length>1?'RECORDS_BULK_DELETED':'RECORD_DELETED',
+        changes:{module:parsed.module,target:parsed.target,ids:parsed.ids.map(x=>x.source?`${x.source}:${x.id}`:x.id),
+          reason:parsed.reason,result,records,deletionSummary,success:true},session});
     },{readConcern:{level:'snapshot'},writeConcern:{w:'majority'}});
   } catch(error) {
     // A denial cannot be logged in the failed transaction; best-effort attempt
@@ -246,11 +272,12 @@ export function buildAuditFilter(query = {}) {
 }
 export const auditLogs=asyncHandler(async(req,res)=>{
   const filter = buildAuditFilter(req.query);
-  const { items, pagination } = await listDocuments(AdminAuditLog, filter, req.query, {
+  const { items: rawItems, pagination } = await listDocuments(AdminAuditLog, filter, req.query, {
     defaultLimit: 25, maxLimit: 100, sorts: ['createdAt', '_id'],
     select: 'performedBy targetUser action changes createdAt',
-    populate: { path: 'performedBy', select: 'firstName lastName email' },
+    populate: [{ path: 'performedBy', select: 'firstName lastName email' }, { path: 'targetUser', select: 'email firstName lastName' }],
   });
+  const items = rawItems.map(item=>({...item,changes:safeAuditValue(item.changes)}));
   res.json({ success: true, data: { items, total: pagination.total ?? null,
     page: pagination.page, limit: pagination.limit, pages: pagination.pages ?? null,
     nextCursor: pagination.nextCursor ?? null, hasMore: pagination.hasMore ?? (pagination.page < pagination.totalPages) } });

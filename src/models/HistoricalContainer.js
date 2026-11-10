@@ -13,16 +13,22 @@ const schema=new mongoose.Schema({
   bookingReference:{type:String,default:''},invoiceReferences:[String],paymentReferences:[String],
   status:{type:String,enum:['UNKNOWN','BOOKED','GATED_IN','STORED','GATE_OUT_APPROVED','RELEASED','CANCELLED'],default:'UNKNOWN',index:true},
   gateIn:{actualGateInAt:Date,remarks:String,inspection:{status:{type:String,enum:['PENDING','ACCEPTED','REJECTED'],default:'PENDING'},sealNumber:String,sealIntact:Boolean,containerCondition:[String],remarks:String}},
-  storage:{storedAt:Date,location:String,remarks:String},
+  inventory:{status:{type:String,enum:['IN_YARD','IN_STORAGE','RELEASE_PENDING','RELEASED'],default:'IN_YARD'},receivedAt:Date,condition:[String],sealNumber:String,notes:String},
+  storage:{storedAt:Date,location:String,remarks:String,block:{type:mongoose.Schema.Types.ObjectId,ref:'StorageBlock',default:null},bay:Number,row:Number,tier:Number,status:{type:String,enum:['WAITING_STORAGE','STORED','RELEASED'],default:null}},
   gateOut:{approvedAt:Date,scheduledDate:String,scheduledTime:String,releasedAt:Date,remarks:String,approvalStatus:{type:String,default:'NONE'}},
   approvals:{gateIn:{type:Boolean,default:false},gateOut:{type:Boolean,default:false}},
   originTransactionDate:Date,
   deletedAt:{type:Date,default:null},deletedBy:{type:mongoose.Schema.Types.ObjectId,ref:'AdminUser',default:null},
   history:[auditEntry],createdBy:{type:mongoose.Schema.Types.ObjectId,ref:'AdminUser'},updatedBy:{type:mongoose.Schema.Types.ObjectId,ref:'AdminUser'},
 },{timestamps:true});
+schema.index({'storage.block':1,status:1,deletedAt:1},{name:'idx_historical_active_storage'});
 schema.index({containerNumber:1},{unique:true,partialFilterExpression:{deletedAt:null,status:{$in:['GATED_IN','STORED','GATE_OUT_APPROVED']}},name:'unique_active_imported_container'});
 schema.index({deletedAt:1,company:1,createdAt:-1,_id:-1},{name:'idx_historical_company_created'});
 schema.index({deletedAt:1,status:1,createdAt:-1,_id:-1},{name:'idx_historical_status_created'});
 schema.index({deletedAt:1,createdAt:-1,_id:-1},{name:'idx_historical_created'});
+schema.index({deletedAt:1,'gateOut.releasedAt':1,'gateIn.actualGateInAt':-1,_id:-1},{name:'idx_inventory_history_gatein'});
+schema.index({deletedAt:1,company:1,'gateIn.actualGateInAt':-1,_id:-1},{name:'idx_report_historical_company_gatein'});
+schema.index({deletedAt:1,company:1,'gateOut.releasedAt':-1,_id:-1},{name:'idx_report_historical_company_gateout'});
+schema.index({deletedAt:1,'gateOut.releasedAt':-1,_id:-1},{name:'idx_report_historical_gateout'});
 
 export default mongoose.model('HistoricalContainer',schema);

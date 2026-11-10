@@ -125,6 +125,28 @@ export const reviewClientGateOut=asyncHandler(async(req,res)=>{
     invoice=await Invoice.findOne({booking:booking._id,type:'GATE_OUT'}).session(session);
     if(!invoice)throw new AppError('Gate-out invoice not found for this booking.',409);
 
+    // A verified in-person payment is a distinct path from client evidence
+    // review. No second receipt or payment record is created here.
+    if(decision==='APPROVE'&&invoice.status==='PAID'&&invoice.balance===0&&
+      booking.workflowStage==='GATE_OUT_PAYMENT_PENDING'&&!booking.gateOut?.approvedAt){
+      payment=await PaymentSubmission.findOne({invoice:invoice._id,status:'VERIFIED'}).sort({createdAt:-1}).session(session);
+      if(!payment)throw new AppError('A verified collected payment is required before Gate-out approval.',409);
+      conditionUponRelease=parseGateOutReleaseCondition(req.body?.conditionUponRelease);
+      conditionRemarks=parseGateOutReleaseRemarks(req.body?.remarks);
+      booking.gateOut.approvalStatus='APPROVED';booking.gateOut.payment.status='VERIFIED';
+      booking.gateOut.approvedAt=new Date();booking.gateOut.approvedBy=String(req.admin._id);
+      booking.gateOut.conditionUponRelease=conditionUponRelease;
+      booking.gateOut.conditionRemarks=conditionRemarks;
+      booking.gateOut.conditionRecordedAt=booking.gateOut.approvedAt;
+      booking.gateOut.conditionRecordedBy=String(req.admin._id);
+      booking.gateOut.readyForReleaseAt=new Date();booking.inventory.status='RELEASE_PENDING';
+      advanceWorkflow(booking,['GATE_OUT_APPROVED','READY_FOR_RELEASE'],{note:'Previously collected payment verified; Gate-out approved'});
+      await booking.save({session});
+      await auditAdminAction({performedBy:req.admin._id,action:'GATE_OUT_APPROVED_AFTER_ADMIN_PAYMENT',
+        changes:{bookingReference:booking.bookingReference,bookingId:String(booking._id),invoice:invoice.number,
+          conditionUponRelease,conditionRemarks,paymentId:String(payment._id)},session});
+      return;
+    }
     // Safe to re-click after a response was lost. Never issue another receipt,
     // charge, audit entry, or workflow transition for a completed decision.
     if(booking.workflowStage!=='GATE_OUT_PAYMENT_SUBMITTED'||invoice.status!=='PAYMENT_SUBMITTED'){

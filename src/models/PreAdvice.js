@@ -204,5 +204,11 @@ schema.index({ status:1, updatedAt:-1, _id:-1 }, {name:'idx_ops_status_updated'}
 schema.index({ deletedAt:1, company:1, createdAt:-1, _id:-1 }, {name:'idx_tracking_company_created'});
 schema.index({ deletedAt:1, createdAt:-1, _id:-1 }, {name:'idx_tracking_created'});
 schema.index({ company:1, 'storage.status':1, createdAt:-1, _id:-1 }, {name:'idx_booking_company_storage'});
+// Reports use physical movement dates, which differ from booking creation.
+schema.index({deletedAt:1,'gateOut.releasedAt':1,'gateIn.actualGateInAt':-1,_id:-1},{name:'idx_inventory_live_gatein'});
+schema.index({company:1,'gateIn.actualGateInAt':-1,_id:-1},{name:'idx_report_company_gatein'});
+schema.index({company:1,'gateOut.releasedAt':-1,_id:-1},{name:'idx_report_company_gateout'});
+schema.index({'gateIn.actualGateInAt':-1,_id:-1},{name:'idx_report_gatein'});
+schema.index({'gateOut.releasedAt':-1,_id:-1},{name:'idx_report_gateout'});
 
 export default mongoose.model('PreAdvice', schema);

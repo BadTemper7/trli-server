@@ -4,6 +4,10 @@ import HistoricalContainer from '../models/HistoricalContainer.js';
 import Invoice from '../models/Invoice.js';
 import PaymentSubmission from '../models/PaymentSubmission.js';
 import StorageMovement from '../models/StorageMovement.js';
+import StorageBlock from '../models/StorageBlock.js';
+import { emitBlockOccupancy } from './storageController.js';
+import { assignStorageClaim, clearStorageClaim, slotIsSame } from '../services/storageAssignmentService.js';
+import { emitToAdminModule } from '../socket/index.js';
 import ClientCompany from '../models/ClientCompany.js';
 import {AppError,asyncHandler} from '../utils/http.js';
 import {validateHistoryChronology,HISTORIC_STATUSES} from '../utils/containerTracking.js';
@@ -43,7 +47,7 @@ async function load(source,id,company=null,allowArchived=false){
   const model=source==='historical'?HistoricalContainer:source==='live'?PreAdvice:null;
   if(!model)throw new AppError('Unknown container source.',400);
   const filter={_id:id};if(!allowArchived)filter.deletedAt=null;if(company)filter.company=company;
-  const row=await model.findOne(filter).populate('company','companyName').lean();
+  const row=await model.findOne(filter).populate('company','companyName').populate('storage.block','name').lean();
   if(!row)throw new AppError('Container not found or unavailable.',404);
   return row;
 }
@@ -69,9 +73,9 @@ export const listContainers = asyncHandler(async(req,res)=>{
     const cursor = parseContainerCursor(req.query, filters);
     const [live, historical] = await Promise.all([
       PreAdvice.find(sourceAfterCursor(filters.live,cursor,'LIVE')).select(LIVE_FIELDS)
-        .populate('company','companyName').sort({createdAt:-1,_id:-1}).limit(paging.limit+1).lean(),
+        .populate('company','companyName').populate('storage.block','name').sort({createdAt:-1,_id:-1}).limit(paging.limit+1).lean(),
       HistoricalContainer.find(sourceAfterCursor(filters.historical,cursor,'HISTORICAL')).select(HISTORICAL_FIELDS)
-        .populate('company','companyName').sort({createdAt:-1,_id:-1}).limit(paging.limit+1).lean(),
+        .populate('company','companyName').populate('storage.block','name').sort({createdAt:-1,_id:-1}).limit(paging.limit+1).lean(),
     ]);
     const merged=[...live.map(x=>dto(x,'LIVE')),...historical.map(x=>dto(x,'HISTORICAL'))].sort(compareContainers);
     const hasMore=merged.length>paging.limit;
@@ -83,9 +87,9 @@ export const listContainers = asyncHandler(async(req,res)=>{
   // Legacy offset pagination retained so deployed portals and integrations do
   // not break; cursor mode is recommended for deep pages / >100k containers.
   const [live,historical,liveTotal,historicalTotal]=await Promise.all([
-    PreAdvice.find(filters.live).select(LIVE_FIELDS).populate('company','companyName')
+    PreAdvice.find(filters.live).select(LIVE_FIELDS).populate('company','companyName').populate('storage.block','name')
       .sort({createdAt:-1,_id:-1}).limit(paging.page*paging.limit).lean(),
-    HistoricalContainer.find(filters.historical).select(HISTORICAL_FIELDS).populate('company','companyName')
+    HistoricalContainer.find(filters.historical).select(HISTORICAL_FIELDS).populate('company','companyName').populate('storage.block','name')
       .sort({createdAt:-1,_id:-1}).limit(paging.page*paging.limit).lean(),
     PreAdvice.countDocuments(filters.live),HistoricalContainer.countDocuments(filters.historical),
   ]);
@@ -114,19 +118,73 @@ export const clientDetail=(req,res,next)=>{req.companyId=req.user.company._id;re
 export const companies=asyncHandler(async(req,res)=>{
   const items=await ClientCompany.find({}).select('companyName').sort({companyName:1}).lean();res.json({success:true,data:{items}});
 });
+const REQUIRED_IMPORTED = {
+  containerSize:['20FT','40FT'],
+  containerType:['DRY CONTAINER','REEFER','TANK CONTAINER','OPEN TOP','FLAT RACK'],
+  loadStatus:['EMPTY','LOADED'],
+  transactionClassification:['LOCAL','INTERNATIONAL'],
+  status:['BOOKED','GATED_IN','STORED','GATE_OUT_APPROVED','RELEASED','CANCELLED'],
+};
+function validateHistoricalFields(data, isNew=false) {
+  for (const [field,choices] of Object.entries(REQUIRED_IMPORTED)) {
+    if ((isNew || data[field] !== undefined) && !choices.includes(data[field])) {
+      throw new AppError(`${field} must be selected from the configured values. Unknown is not allowed.`,400);
+    }
+  }
+  if (isNew && ['GATED_IN','STORED','GATE_OUT_APPROVED','RELEASED'].includes(data.status) && !data.gateIn?.actualGateInAt) {
+    throw new AppError('Gated-in and released historical containers require their actual Gate-in date.',400);
+  }
+  if (data.status === 'STORED' && !data.storage?.block) {
+    throw new AppError('Choose a storage block and available slot for a container currently in storage.',400);
+  }
+}
+function requestedHistoricalPosition(doc, updates) {
+  const next = { ...(doc.storage?.toObject?.() || doc.storage || {}), ...(updates.storage || {}) };
+  if (updates.status && !['GATED_IN','STORED','GATE_OUT_APPROVED'].includes(updates.status)) return null;
+  const active = ['GATED_IN','STORED','GATE_OUT_APPROVED'].includes(updates.status || doc.status) && !doc.gateOut?.releasedAt && !updates.gateOut?.releasedAt;
+  if (!active || !next.block) return null;
+  return next;
+}
+function historicalSlotInput(data) {
+  const value=data.storage || {};
+  if (value.block && (!['GATED_IN','STORED','GATE_OUT_APPROVED'].includes(data.status) || !data.gateIn?.actualGateInAt)) {
+    throw new AppError('Storage assignment requires an active gated-in container with an actual Gate-in date.',400);
+  }
+  if (value.block && data.status === 'GATED_IN') data.status='STORED';
+  if (value.block) value.status='STORED';
+  return value;
+}
 export const addHistorical=asyncHandler(async(req,res)=>{
   const data=cleanInput(req.body);
   if(!data.containerNumber||!isValid(data.company))throw new AppError('Container number and existing client company are required.',400);
+  if (!await ClientCompany.exists({_id:data.company})) throw new AppError('Select an existing client company.',400);
+  historicalSlotInput(data);
+  validateHistoricalFields(data,true);
   if(['GATED_IN','STORED','GATE_OUT_APPROVED'].includes(data.status))await ensureNoActiveDuplicate(data.containerNumber);
   const doc=new HistoricalContainer({...data,createdBy:req.admin._id,updatedBy:req.admin._id});
   validateHistoryChronology(doc.toObject());
-  doc.history.push({action:'HISTORICAL_IMPORT',performedBy:req.admin._id,after:doc.toObject(),note:'Manually imported existing/historical container'});
   const session=await mongoose.startSession();
-  try{await session.withTransaction(async()=>{
+  try { await session.withTransaction(async()=>{
+    if (doc.storage?.block) {
+      const position=await assignStorageClaim({blockId:doc.storage.block,position:doc.storage,containerSize:doc.containerSize,
+        source:'HISTORICAL',containerId:doc._id,session});
+      doc.storage={...doc.storage.toObject(),...position,status:'STORED',storedAt:doc.storage.storedAt||doc.gateIn.actualGateInAt};
+    }
+    doc.inventory.status=doc.status==='RELEASED'?'RELEASED':doc.storage?.block?'IN_STORAGE':'IN_YARD';
+    doc.inventory.receivedAt=doc.gateIn?.actualGateInAt||null;
+    doc.history.push({action:'HISTORICAL_IMPORT',performedBy:req.admin._id,after:doc.toObject(),note:'Registered existing container with verified storage assignment'});
     await doc.save({session});
-    await auditAdminAction({performedBy:req.admin._id,action:'HISTORICAL_CONTAINER_IMPORTED',changes:{id:String(doc._id),containerNumber:doc.containerNumber},session});
+    await auditAdminAction({performedBy:req.admin._id,action:'HISTORICAL_CONTAINER_IMPORTED',changes:{id:String(doc._id),containerNumber:doc.containerNumber,company:String(doc.company),status:doc.status,containerSize:doc.containerSize,containerType:doc.containerType,loadStatus:doc.loadStatus,gateInAt:doc.gateIn?.actualGateInAt,storage:doc.storage},session});
   });} finally {await session.endSession();}
   clearSummaryCache();
+  emitToAdminModule(MODULES.INVENTORY,'inventory:updated',{id:String(doc._id),source:'HISTORICAL'});
+  if(doc.storage?.block){
+    emitToAdminModule(MODULES.STORAGE_MONITORING,'storage:container-assigned',{
+      id:String(doc._id),source:'HISTORICAL',containerNumber:doc.containerNumber,containerSize:doc.containerSize,size:doc.containerSize,containerType:doc.containerType,type:doc.containerType,
+      company:doc.company,storage:{block:String(doc.storage.block),bay:doc.storage.bay,row:doc.storage.row,tier:doc.storage.tier,storedAt:doc.storage.storedAt},
+    });
+    await emitBlockOccupancy(doc.storage.block);
+  }
   res.status(201).json({success:true,data:{item:dto(doc.toObject(),'HISTORICAL')}});
 });
 export const editContainer=asyncHandler(async(req,res)=>{
@@ -171,7 +229,7 @@ export const editContainer=asyncHandler(async(req,res)=>{
         vatInclusive:adjustedInvoice.vatInclusive,vatableSales:adjustedInvoice.vatableSales,
         nonVatableSales:adjustedInvoice.nonVatableSales}},{session});
       await PreAdvice.updateOne({_id:doc._id},{$set:corrections,$push:{statusHistory:{status:'RECORD_CORRECTION',changedAt:new Date(),note:String(req.body.changeReason||'').slice(0,300)}}},{session});
-      await auditAdminAction({performedBy:req.admin._id,action:'LIVE_CONTAINER_CORRECTED',changes:{containerId:String(doc._id),before:{containerNumber:before.containerNumber,gateIn:before.gateIn,storage:before.storage,gateOut:before.gateOut},updates},session});
+      await auditAdminAction({performedBy:req.admin._id,action:'LIVE_CONTAINER_CORRECTED',changes:{containerId:String(doc._id),module:'CONTAINER_TRACKING',containerNumber:next.containerNumber,reason:String(req.body.changeReason||'').slice(0,300),before:{containerNumber:before.containerNumber,containerSize:before.containerSize,containerType:before.containerType,loadStatus:before.loadStatus,gateIn:before.gateIn,storage:before.storage,gateOut:before.gateOut},after:{containerNumber:next.containerNumber,containerSize:next.containerSize,containerType:next.containerType,loadStatus:next.loadStatus,gateIn:next.gateIn,storage:next.storage,gateOut:next.gateOut}},session});
     });}finally{await session.endSession();}
   } else {
     if(updates.containerNumber && updates.containerNumber!==doc.containerNumber && ['GATED_IN','STORED','GATE_OUT_APPROVED'].includes(updates.status||doc.status))await ensureNoActiveDuplicate(updates.containerNumber,{source:'historical',id:doc._id});
@@ -184,14 +242,43 @@ export const editContainer=asyncHandler(async(req,res)=>{
         if(['gateIn','storage','gateOut','approvals'].includes(key))historical[key]={...historical[key]?.toObject?.(),...value};
         else historical[key]=value;
       }
+      if (historical.storage?.block && historical.status==='GATED_IN') historical.status='STORED';
+      validateHistoricalFields(historical.toObject());
+      if (['GATED_IN','STORED','GATE_OUT_APPROVED','RELEASED'].includes(historical.status) && !historical.gateIn?.actualGateInAt) throw new AppError('Historical movement requires an actual Gate-in date.',400);
+      if (historical.storage?.block && !historical.gateIn?.actualGateInAt) throw new AppError('A storage assignment requires an actual Gate-in date.',400);
+      const beforeSlot=before.storage?.block && ['GATED_IN','STORED','GATE_OUT_APPROVED'].includes(before.status)
+        && !before.gateOut?.releasedAt ? before.storage : null;
+      const afterSlot=requestedHistoricalPosition(historical,{});
+      if (afterSlot && (!beforeSlot || !slotIsSame(beforeSlot,afterSlot))) {
+        await assignStorageClaim({blockId:afterSlot.block,position:afterSlot,containerSize:historical.containerSize,
+          source:'HISTORICAL',containerId:historical._id,session});
+        historical.storage.status='STORED';
+      } else if (!afterSlot && beforeSlot) {
+        await clearStorageClaim({source:'HISTORICAL',containerId:historical._id,session});
+        historical.storage.block=null;historical.storage.bay=null;historical.storage.row=null;historical.storage.tier=null;
+        historical.storage.status='RELEASED';
+      }
       validateHistoryChronology(historical.toObject());
+      historical.inventory.status=historical.status==='RELEASED'?'RELEASED':historical.storage?.block?'IN_STORAGE':'IN_YARD';
+      historical.inventory.receivedAt=historical.gateIn?.actualGateInAt||null;
       historical.updatedBy=req.admin._id;
       historical.history.push({action:'HISTORICAL_CORRECTION',performedBy:req.admin._id,before,after:updates,note:String(req.body.changeReason||'').slice(0,300)});
       await historical.save({session});
-      await auditAdminAction({performedBy:req.admin._id,action:'HISTORICAL_CONTAINER_CORRECTED',changes:{id:String(doc._id),updates},session});
+      await auditAdminAction({performedBy:req.admin._id,action:'HISTORICAL_CONTAINER_CORRECTED',changes:{id:String(doc._id),module:'CONTAINER_TRACKING',containerNumber:historical.containerNumber,reason:String(req.body.changeReason||'').slice(0,300),before:{containerNumber:before.containerNumber,status:before.status,containerSize:before.containerSize,containerType:before.containerType,loadStatus:before.loadStatus,storage:before.storage,gateIn:before.gateIn,gateOut:before.gateOut},after:{containerNumber:historical.containerNumber,status:historical.status,containerSize:historical.containerSize,containerType:historical.containerType,loadStatus:historical.loadStatus,storage:historical.storage,gateIn:historical.gateIn,gateOut:historical.gateOut}},session});
     });} finally {await session.endSession();}
   }
   clearSummaryCache();
+  emitToAdminModule(MODULES.INVENTORY,'inventory:updated',{id:req.params.id,source:req.params.source});
+  if(source==='historical'){
+    const changed=await HistoricalContainer.findById(req.params.id).lean();
+    if(doc.storage?.block)await emitBlockOccupancy(doc.storage.block);
+    if(changed?.storage?.block)await emitBlockOccupancy(changed.storage.block);
+    emitToAdminModule(MODULES.STORAGE_MONITORING,'storage:container-relocated',{
+      id:String(changed._id),source:'HISTORICAL',containerNumber:changed.containerNumber,
+      size:changed.containerSize,type:changed.containerType,containerSize:changed.containerSize,containerType:changed.containerType,
+      storage:{block:changed.storage?.block?String(changed.storage.block):null,bay:changed.storage?.bay,row:changed.storage?.row,tier:changed.storage?.tier,storedAt:changed.storage?.storedAt},
+    });
+  }
   res.json({success:true,message:'Container changes saved and audited.'});
 });
 export const deleteContainer=asyncHandler(async(req,res)=>{
@@ -199,6 +286,11 @@ export const deleteContainer=asyncHandler(async(req,res)=>{
   if(source==='live'){
     const invoiced=await Invoice.exists({booking:doc._id});
     if(invoiced||doc.gateIn?.actualGateInAt||!['CANCELLED','REJECTED'].includes(doc.status))throw new AppError('Container is linked to active operations or financial records. It cannot be deleted.',409);
+  } else if(['GATED_IN','STORED','GATE_OUT_APPROVED'].includes(doc.status) && !doc.gateOut?.releasedAt) {
+    // Archiving a physical occupant would hide it from occupancy queries while
+    // leaving its unique slot claim reserved, and could cause a double booking.
+    // Require a documented physical release before the record can be archived.
+    throw new AppError('An active historical container must be physically released before it can be archived.',409);
   }
   const session=await mongoose.startSession();
   try{
@@ -211,7 +303,7 @@ export const deleteContainer=asyncHandler(async(req,res)=>{
         const result=await HistoricalContainer.updateOne({_id:id,deletedAt:null},{$set:{deletedAt:timestamp,deletedBy:req.admin._id},$push:{history:{action:'SOFT_DELETED',performedBy:req.admin._id,before:{status:doc.status},note:'Retained for audit and recovery'}}},{session});
         if(result.modifiedCount!==1)throw new AppError('Container has already been archived.',409);
       }
-      await auditAdminAction({performedBy:req.admin._id,action:'CONTAINER_SOFT_DELETED',changes:{source,id,containerNumber:doc.containerNumber},session});
+      await auditAdminAction({performedBy:req.admin._id,action:'CONTAINER_SOFT_DELETED',changes:{module:'CONTAINER_TRACKING',source,id,containerNumber:doc.containerNumber,reason:String(req.body?.reason||'').trim().slice(0,500),before:{status:doc.status,containerNumber:doc.containerNumber,containerSize:doc.containerSize,containerType:doc.containerType,loadStatus:doc.loadStatus}},session});
     });
   } finally {await session.endSession();}
   clearSummaryCache();

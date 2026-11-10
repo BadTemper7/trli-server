@@ -11,4 +11,9 @@ const schema = new mongoose.Schema({
 schema.index({createdAt:-1,_id:-1},{name:'idx_audit_cursor'});
 schema.index({action:1,createdAt:-1,_id:-1},{name:'idx_audit_action_cursor'});
 
+// Preserve a tamper-resistant append-only audit trail at the application layer.
+for (const method of ['updateOne','updateMany','findOneAndUpdate','deleteOne','deleteMany','findOneAndDelete','findOneAndReplace','replaceOne']) {
+  schema.pre(method, function(){ throw new Error('Audit log entries are immutable.'); });
+}
+schema.pre('save', function(){ if(!this.isNew)throw new Error('Audit log entries are immutable.'); });
 export default mongoose.model('AdminAuditLog', schema);

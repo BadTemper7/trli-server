@@ -1,12 +1,14 @@
 import {deleteRecords} from '../controllers/bulkDeletionController.js';
 import { Router } from 'express';
 import { adminAuth, requirePasswordChanged } from '../middleware/adminAuth.js';
-import { requirePermission } from '../middleware/requirePermission.js';
+import { requirePermission, hasPermission } from '../middleware/requirePermission.js';
+import { AppError } from '../utils/http.js';
 import { MODULES, ACTIONS } from '../constants/permissions.js';
 import { validateId } from '../middleware/validateId.js';
-import { assignContainer, blockContainers, createBlock, deleteBlock, getBlock, listBlocks, movementHistory, relocateContainer, removeContainer, updateBlock, waitingContainers } from '../controllers/storageController.js';
+import { assignContainer, storageSlots, blockContainers, createBlock, deleteBlock, getBlock, listBlocks, movementHistory, relocateContainer, removeContainer, updateBlock, waitingContainers } from '../controllers/storageController.js';
 const router=Router();router.use(adminAuth,requirePasswordChanged);
-router.get('/blocks',requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.VIEW),listBlocks);
+const readPositions = (req,res,next) => hasPermission(req.admin,MODULES.STORAGE_MONITORING,ACTIONS.VIEW) || hasPermission(req.admin,MODULES.CONTAINER_TRACKING,ACTIONS.CREATE) || hasPermission(req.admin,MODULES.CONTAINER_TRACKING,ACTIONS.EDIT) ? next() : next(new AppError('Storage location access is required.',403));
+router.get('/blocks',readPositions,listBlocks);
 router.post('/blocks',requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.CREATE),createBlock);
 router.get('/waiting',requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.VIEW),waitingContainers);
 router.get('/containers/:containerId/movements',validateId('containerId'),requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.VIEW),movementHistory);
@@ -15,6 +17,7 @@ router.post('/containers/:containerId/remove',validateId('containerId'),requireP
 router.get('/blocks/:id',validateId(),requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.VIEW),getBlock);
 router.put('/blocks/:id',validateId(),requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.EDIT),updateBlock);
 router.delete('/blocks/:id',validateId(),requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.DELETE),(req,res,next)=>{req.body={...req.body,module:'STORAGE_MONITORING',target:'STORAGE_BLOCK',ids:[req.params.id]};return deleteRecords(req,res,next);});
+router.get('/blocks/:id/slots',validateId(),readPositions,storageSlots);
 router.get('/blocks/:id/containers',validateId(),requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.VIEW),blockContainers);
 router.post('/blocks/:id/assign',validateId(),requirePermission(MODULES.STORAGE_MONITORING,ACTIONS.ASSIGN),assignContainer);
 export default router;

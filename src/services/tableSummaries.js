@@ -1,6 +1,7 @@
 import PreAdvice from '../models/PreAdvice.js';
 import Invoice from '../models/Invoice.js';
 import HistoricalContainer from '../models/HistoricalContainer.js';
+import { inventoryTotals } from './inventoryService.js';
 import { getCachedSummary } from '../utils/summaryCache.js';
 import { buildBookingFilter, buildInvoiceFilter, buildOperationFilter, buildContainerFilters, summaryScope } from './tableFilters.js';
 
@@ -24,11 +25,12 @@ export async function getBookingSummary(query, company, defaultScope = 'filtered
   const loader = () => bookingSummary(filter);
   return { scope, summary: scope === 'global' ? await getCachedSummary(`booking:${company}`, loader) : await loader() };
 }
-const blankInvoice = () => ({ total: 0, unpaid: 0, pending: 0, gateInPending: 0, paid: 0, cancelled: 0, void: 0,
+const blankInvoice = () => ({ total: 0, unpaid: 0, partiallyPaid: 0, pending: 0, gateInPending: 0, paid: 0, cancelled: 0, void: 0,
   totalAmount: 0, vatAmount: 0, vatableSales: 0, nonVatableSales: 0, amountPaid: 0, outstandingBalance: 0 });
 export async function invoiceSummary(filter) {
   const [data] = await Invoice.aggregate([{ $match: filter }, { $group: { _id: null,
-    total: { $sum: 1 }, unpaid: countIf({ $eq: ['$status', 'UNPAID'] }),
+    total: { $sum: 1 }, unpaid: countIf({ $in: ['$status', ['UNPAID','PARTIALLY_PAID']] }),
+    partiallyPaid: countIf({ $eq: ['$status','PARTIALLY_PAID'] }),
     pending: countIf({ $eq: ['$status', 'PAYMENT_SUBMITTED'] }),
     gateInPending: countIf({ $and: [{ $eq: ['$status', 'PAYMENT_SUBMITTED'] }, { $eq: ['$type', 'GATE_IN'] }] }),
     paid: countIf({ $eq: ['$status', 'PAID'] }),
@@ -71,8 +73,8 @@ export async function getOperationSummary(query, kind) {
   // Queue tabs are status breakdowns: show all statuses matching search even
   // when one queue is selected, so their card counts stay comparable.
   const filters = scope === 'global' ? {} : { ...query, queue: undefined };
-  const filter = buildOperationFilter(filters, kind);
-  const loader = () => operationSummary(filter, kind);
+  const filter = kind === 'inventory' ? null : buildOperationFilter(filters,kind);
+  const loader = () => kind === 'inventory' ? inventoryTotals(filters) : operationSummary(filter,kind);
   return { scope, summary: scope === 'global' ? await getCachedSummary(`operations:${kind}`, loader) : await loader() };
 }
 export async function getContainerSummary(query, company, isAdmin) {
