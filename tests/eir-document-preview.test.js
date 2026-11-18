@@ -45,7 +45,8 @@ test('EIR is shown in the booking form, details, admin review and protected prev
   assert.match(source('../../client/src/pages/portal/PreAdviceForm.jsx'), /files\.eir/);
   assert.match(source('../../client/src/pages/portal/PreAdviceDetail.jsx'), /setPreviewDocument/);
   assert.match(source('../../admin/src/pages/PreAdvice/PreAdvicePage.jsx'), /Uploaded Booking Documents/);
-  assert.match(source('../../admin/src/components/documents/AdminDocumentPreview.jsx'), /credentials: 'include'/);
+  assert.match(source('../../admin/src/components/documents/AdminDocumentPreview.jsx'), /adminFetch\(request\.path/);
+  assert.match(source('../../admin/src/lib/adminApi.js'), /credentials:'include'/);
   assert.match(source('../../client/src/components/documents/DocumentPreview.jsx'), /responseType: 'blob'/);
 });
 

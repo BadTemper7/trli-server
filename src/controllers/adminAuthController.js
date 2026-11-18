@@ -9,6 +9,11 @@ import { isStrongPassword } from '../utils/adminPassword.js';
 const secret = () => process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET;
 const cookieOptions = (req) => authCookieOptions(req, Number(process.env.ADMIN_SESSION_HOURS || 12)*3600*1000);
 function sign(admin){return jwt.sign({sub:String(admin._id),type:'admin',tv:admin.tokenVersion||0},secret(),{expiresIn:process.env.ADMIN_JWT_EXPIRES_IN||'12h'})}
+function signBrowserFallback(admin){
+  const requested=Number(process.env.ADMIN_BROWSER_FALLBACK_MINUTES||60);
+  const minutes=Number.isInteger(requested)?Math.max(15,Math.min(requested,120)):60;
+  return jwt.sign({sub:String(admin._id),type:'admin',tv:admin.tokenVersion||0,purpose:'browser-compatibility'},secret(),{expiresIn:`${minutes}m`});
+}
 function safe(admin){const obj=admin.toObject();obj.id=String(obj._id);delete obj.passwordHash;obj.isSystemProtected=Boolean(admin.isSystemProtected||(process.env.SUPER_ADMIN_EMAIL && admin.role==='SUPER_ADMIN' && admin.email===process.env.SUPER_ADMIN_EMAIL.trim().toLowerCase()));return obj}
 
 export const login = asyncHandler(async(req,res)=>{
@@ -22,7 +27,8 @@ export const login = asyncHandler(async(req,res)=>{
   }
   admin.lastLoginAt=new Date(); await admin.save();
   res.cookie('adminToken',sign(admin),cookieOptions(req));
-  ok(res,{user:safe(admin),requiresPasswordChange:Boolean(admin.mustChangePassword)},admin.mustChangePassword?'Password setup required.':'Login successful.');
+  const fallbackRequested=req.body?.compatibilityFallback===true;
+  ok(res,{user:safe(admin),requiresPasswordChange:Boolean(admin.mustChangePassword),...(fallbackRequested?{fallbackToken:signBrowserFallback(admin)}:{})},admin.mustChangePassword?'Password setup required.':'Login successful.');
 });
 
 export const logout=asyncHandler(async(req,res)=>{res.clearCookie('adminToken',{...cookieOptions(req),maxAge:0});ok(res,{},'Logged out.')});

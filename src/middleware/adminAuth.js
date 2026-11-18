@@ -5,7 +5,9 @@ import { AppError, asyncHandler } from '../utils/http.js';
 const secret = () => process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET;
 
 export const adminAuth = asyncHandler(async (req, res, next) => {
-  const token = req.cookies?.adminToken || req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  // Prefer a deliberate Authorization header for browsers that block cross-origin
+  // cookies. Ordinary browsers continue using the HttpOnly adminToken cookie.
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '') || req.cookies?.adminToken;
   if (!token) throw new AppError('Admin authentication required.', 401);
   let payload;
   try { payload = jwt.verify(token, secret()); } catch { throw new AppError('Admin session is invalid or expired.', 401); }
