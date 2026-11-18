@@ -164,9 +164,10 @@ async function executeDelete(req,parsed,session,files) {
   }
   if(module==='PAYMENT_TYPES') {
     const docs=await PaymentType.find({_id:{$in:ids}}).session(session).lean();if(docs.length!==ids.length)throw new AppError('Some payment types no longer exist.',409);
-    const pending=await PaymentSubmission.exists({method:{$in:docs.map(x=>x.code)},status:'PENDING_VERIFICATION'}).session(session);
-    if(pending)throw new AppError('A payment type has pending client submissions. Verify or reject them before deleting this method.',409);
-    await PaymentType.deleteMany({_id:{$in:ids}},{session});return {count:ids.length,methods:docs.map(x=>({code:x.code,name:x.name}))};
+    // Never delete configured accounts. Payment histories store receiving
+    // account snapshots, and methods may be disabled without losing them.
+    await PaymentType.updateMany({_id:{$in:ids}},{$set:{status:'INACTIVE',updatedBy:req.admin._id}},{session});
+    return {count:ids.length,disabled:true,methods:docs.map(x=>({code:x.code,name:x.name}))};
   }
   if(module==='USER_MANAGEMENT') {
     const docs=await AdminUser.find({_id:{$in:ids}}).session(session).lean();if(docs.length!==ids.length)throw new AppError('Some administrator accounts no longer exist.',409);
@@ -235,16 +236,17 @@ export const deleteRecords=asyncHandler(async(req,res)=>{
         ...(result.historical||[]).map(x=>({recordId:x.id,containerNumber:x.container,recordType:'Historical Container',previousStatus:x.status,result:'Deleted'})),
         ...(result.containers||[]).map(x=>({containerNumber:x.number,recordType:'Forwarding Container',previousStatus:x.status,result:'Deleted'})),
         ...(result.rates||[]).map(x=>({recordName:x.name,recordType:'Rate',previousStatus:'Configured',result:'Deleted'})),
+        ...(result.methods||[]).map(x=>({recordName:x.name,recordType:'Payment Type',result:'Disabled'})),
         ...(result.users||[]).map(x=>({recordName:x.email,recordType:'Administrator',result:'Deleted'})),
         ...(result.companies||[]).map(x=>({recordName:x,recordType:'Client',result:'Deleted'})),
         ...(result.blocks||[]).map(x=>({recordName:x,recordType:'Storage Block',result:'Deleted'})),
         ...(result.removedInvoices||[]).map(x=>({recordName:x.number,recordType:'Invoice',previousStatus:x.status,result:'Deleted'})),
         ...(result.removedPayments||[]).map(x=>({recordName:x.receiptNumber||x.reference||'Payment',recordType:'Payment',previousStatus:x.status,result:'Deleted'})),
       ];
-      const deletionSummary={totalRecordsDeleted:result.count||0,historicalRecordsDeleted:(result.historical||[]).length,
+      const deletionSummary={totalRecordsDeleted:result.disabled?0:(result.count||0),historicalRecordsDeleted:(result.historical||[]).length,
         financialRecordsDeleted:(result.removedInvoices||[]).length+(result.removedPayments||[]).length,
         invoicesDeleted:(result.removedInvoices||[]).length,paymentsDeleted:(result.removedPayments||[]).length};
-      await auditAdminAction({performedBy:req.admin._id,action:parsed.ids.length>1?'RECORDS_BULK_DELETED':'RECORD_DELETED',
+      await auditAdminAction({performedBy:req.admin._id,action:parsed.module==='PAYMENT_TYPES'?'PAYMENT_TYPES_DISABLED':parsed.ids.length>1?'RECORDS_BULK_DELETED':'RECORD_DELETED',
         changes:{module:parsed.module,target:parsed.target,ids:parsed.ids.map(x=>x.source?`${x.source}:${x.id}`:x.id),
           reason:parsed.reason,result,records,deletionSummary,success:true},session});
     },{readConcern:{level:'snapshot'},writeConcern:{w:'majority'}});
@@ -257,7 +259,7 @@ export const deleteRecords=asyncHandler(async(req,res)=>{
   const fileFailures=await cleanupFiles(files);
   if(fileFailures.length){try{await auditAdminAction({performedBy:req.admin._id,action:'DELETE_FILE_CLEANUP_FAILED',changes:{module:parsed.module,files:fileFailures}});}catch{}}
   clearSummaryCache();
-  res.json({success:true,message:`${result.count} record(s) deleted and logged.`,data:{...result,fileCleanupWarnings:fileFailures.length}});
+  res.json({success:true,message:result.disabled?`${result.count} payment method(s) disabled and logged.`:`${result.count} record(s) deleted and logged.`,data:{...result,fileCleanupWarnings:fileFailures.length}});
 });
 
 export function buildAuditFilter(query = {}) {

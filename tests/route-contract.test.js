@@ -52,9 +52,11 @@ test('site settings defaults to 4 and rejects uncontrolled hourly bookings',()=>
  assert.match(model,/maxBookingsPerHour:\{type:Number,default:4/);
  assert.match(slots,/\$expr:\{\$lt:\[\{\$size:'\$bookings'\},s\.maxBookingsPerHour\]\}/);
 });
-test('backend prevents payment status changes by clients and rejects cash',()=>{
+test('client transfers remain review-only and cash cannot be submitted as online proof',()=>{
  const api=read('../src/routes/invoiceRoutes.js'), service=read('../src/controllers/invoiceController.js');
  assert.match(api,/adminInvoices\.post\('\/payments\/:id\/review',requirePermission/);
- assert.match(service,/await getReceivingMethod\(method\)/);
- assert.match(read('../src/services/paymentMethods.js'),/!ONLINE_METHODS\.includes\(code\)/);
+ assert.match(service,/await getReceivingMethod\(methodId\)/);
+ assert.match(service,/paymentType:receivingMethod\._id/);
+ assert.match(read('../src/services/paymentMethods.js'),/if \(row\.code === 'CASH'\)/);
+ assert.match(read('../src/services/paymentMethods.js'),/if \(!allowCash\)/);
 });

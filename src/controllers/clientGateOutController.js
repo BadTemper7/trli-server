@@ -9,7 +9,7 @@ import ClientCompany from '../models/ClientCompany.js';
 import PreAdvice from '../models/PreAdvice.js';
 import Invoice from '../models/Invoice.js';
 import PaymentSubmission from '../models/PaymentSubmission.js';
-import { getReceivingMethod, receivingAccountSnapshot } from '../services/paymentMethods.js';
+import { getPaymentChoice, receivingAccountSnapshot } from '../services/paymentMethods.js';
 import {reserveSlot,releaseSlot,validateSlot} from '../utils/bookingSlots.js';
 import {AppError,asyncHandler} from '../utils/http.js';
 import {advanceWorkflow} from '../utils/preAdviceWorkflow.js';
@@ -63,9 +63,13 @@ export const requestClientGateOut=asyncHandler(async(req,res)=>{
  try{
   await validateUploadedProof(file);
   const day=String(req.body.scheduledDate||''),hour=String(req.body.scheduledTime||'');
-  const method=String(req.body.method||'').toUpperCase(),reference=String(req.body.reference||'').trim();
-  validatePaymentEvidence(reference,file);
-  const receivingMethod = await getReceivingMethod(method);
+  const methodId=String(req.body.method||'').trim(),reference=String(req.body.reference||'').trim();
+  const receivingMethod = await getPaymentChoice(methodId,{allowCash:true});
+  const method=receivingMethod.code;
+  const cash=method==='CASH';
+  if(cash) {
+    if(reference||file)throw new AppError('Cash is paid in person; do not attach online transfer evidence.',400);
+  } else validatePaymentEvidence(reference,file);
   const booking=await PreAdvice.findOne({_id:req.params.id,company:req.user.company._id});
   if(!booking)throw new AppError('Booking not found.',404);
   validateGateOutAfterArrival(booking,day,hour);
@@ -85,27 +89,105 @@ export const requestClientGateOut=asyncHandler(async(req,res)=>{
     await reserveSlot(fresh._id,day,hour,session,'GATE_OUT');
     let invoice=await Invoice.findOne({booking:fresh._id,type:'GATE_OUT'}).session(session);
     if(invoice && !['UNPAID','VOID'].includes(invoice.status))throw new AppError('Existing gate-out payment or invoice cannot be replaced.',409);
-    if(invoice){Object.assign(invoice,quote,{status:'PAYMENT_SUBMITTED',paidAmount:0,balance:quote.total});await invoice.save({session});}
-    else invoice=(await Invoice.create([{...quote,number:await nextReference('INVOICE',new Date(),session),booking:fresh._id,company:fresh.company,type:'GATE_OUT',status:'PAYMENT_SUBMITTED'}],{session}))[0];
-    await PaymentSubmission.create([{invoice:invoice._id,company:fresh.company,booking:fresh._id,method,reference,amount,receivingAccount:receivingAccountSnapshot(receivingMethod),proof:file?{storedName:file.filename,name:file.originalname,mimeType:file.mimetype,size:file.size}:undefined,submittedBy:req.user._id}],{session});
+    const invoiceStatus=cash?'UNPAID':'PAYMENT_SUBMITTED';
+    if(invoice){Object.assign(invoice,quote,{status:invoiceStatus,paidAmount:0,balance:quote.total});await invoice.save({session});}
+    else invoice=(await Invoice.create([{...quote,number:await nextReference('INVOICE',new Date(),session),booking:fresh._id,company:fresh.company,type:'GATE_OUT',status:invoiceStatus}],{session}))[0];
+    if(!cash)await PaymentSubmission.create([{invoice:invoice._id,company:fresh.company,booking:fresh._id,method,paymentType:receivingMethod._id,reference,amount,receivingAccount:receivingAccountSnapshot(receivingMethod),proof:file?{storedName:file.filename,name:file.originalname,mimeType:file.mimetype,size:file.size}:undefined,submittedBy:req.user._id}],{session});
     fresh.gateOut.approvalStatus='PENDING_APPROVAL';fresh.gateOut.requestedAt=new Date();fresh.gateOut.requestedBy=String(req.user._id);fresh.gateOut.scheduledDate=day;fresh.gateOut.scheduledTime=hour;
     fresh.gateOut.truckPlateNumber=fresh.truckPlateNumber;fresh.gateOut.driverName=fresh.driverName;
     fresh.gateOut.remarks='';fresh.gateOut.conditionUponRelease=[];fresh.gateOut.conditionRemarks='';fresh.gateOut.conditionRecordedAt=null;fresh.gateOut.conditionRecordedBy=null;
-    fresh.gateOut.payment.status='SUBMITTED';fresh.gateOut.payment.amountDue=quote.total;fresh.gateOut.payment.amountSubmitted=amount;fresh.gateOut.payment.method=method;fresh.gateOut.payment.referenceNumber=reference;fresh.gateOut.payment.submittedAt=new Date();
-    advanceWorkflow(fresh,stages,{note:'Gate-out request and online payment proof submitted; pending admin approval'});
+    fresh.gateOut.payment.status=cash?'PENDING':'SUBMITTED';fresh.gateOut.payment.amountDue=quote.total;fresh.gateOut.payment.amountSubmitted=cash?0:amount;fresh.gateOut.payment.method=method;fresh.gateOut.payment.referenceNumber=reference;fresh.gateOut.payment.submittedAt=cash?null:new Date();
+    advanceWorkflow(fresh,cash?['GATE_OUT_REQUESTED','GATE_OUT_PAYMENT_PENDING']:stages,{note:cash?'Cash selected; awaiting collection by cashier':'Gate-out request and online payment proof submitted; pending admin approval'});
     await fresh.save({session});
    });
    committed=true;
   }finally{await session.endSession();}
-  await createNotification({company:booking.company,audience:'ADMIN',type:'GATE_OUT_REQUESTED',title:'Gate-out request ready for review',message:`${booking.bookingReference} submitted a gate-out request and payment proof.`,data:{id:booking._id,bookingId:booking._id,bookingReference:booking.bookingReference}}).catch(console.error);
+  await createNotification({company:booking.company,audience:'ADMIN',type:'GATE_OUT_REQUESTED',title:'Gate-out request ready for review',message:cash?`${booking.bookingReference} chose Cash for Gate-out. Collect and verify payment before approval.`:`${booking.bookingReference} submitted a gate-out request and payment proof.`,data:{id:booking._id,bookingId:booking._id,bookingReference:booking.bookingReference}}).catch(console.error);
   clearSummaryCache();
   emitToAdminModule(MODULES.GATE_OUT,'gate-out:updated',{id:String(booking._id),bookingReference:booking.bookingReference});
   emitToAdminModule(MODULES.PAYMENT_HISTORY,'invoice:updated',{bookingId:String(booking._id)});
-  getIO()?.to(`company:${booking.company}`).emit('pre-advice:workflow-updated',{id:String(booking._id),workflowStage:'GATE_OUT_PAYMENT_SUBMITTED'});
+  getIO()?.to(`company:${booking.company}`).emit('pre-advice:workflow-updated',{id:String(booking._id),workflowStage:cash?'GATE_OUT_PAYMENT_PENDING':'GATE_OUT_PAYMENT_SUBMITTED'});
   getIO()?.to(`company:${booking.company}`).emit('invoice:updated',{bookingId:String(booking._id)});
-  res.json({success:true,message:'Gate-out request and payment submitted for verification.',data:{bookingId:booking._id}});
+  res.json({success:true,message:cash?'Gate-out request sent. Pay Cash at the terminal cashier; no payment has been recorded yet.':'Gate-out request and payment submitted for verification.',data:{bookingId:booking._id,paymentMethod:method,paymentStatus:cash?'UNPAID':'PENDING_VERIFICATION'}});
  }catch(e){if(!committed&&file?.path)await fs.unlink(file.path).catch(()=>{});throw paymentReviewFailure(e,{reference:req.body?.reference});}
 });
+// Existing Gate-out payment screen: a client who first chose Cash may later
+// submit verified bank/e-wallet evidence. The invoice remains unpaid until the
+// authorized administrator verifies the submission.
+// A client may change an unpaid, already scheduled Gate-out to Cash without
+// creating a PaymentSubmission or falsely marking the invoice paid.
+export const selectClientGateOutCash = asyncHandler(async(req,res)=>{
+ const choice=await getPaymentChoice(req.body.paymentTypeId||req.body.method,{allowCash:true});
+ if(choice.code!=='CASH')throw new AppError('Select Cash to pay at the terminal.',400);
+ const booking=await PreAdvice.findOne({_id:req.params.id,company:req.user.company._id,workflowStage:'GATE_OUT_PAYMENT_PENDING'});
+ if(!booking)throw new AppError('Only a Gate-out request awaiting payment can select Cash.',409);
+ const invoice=await Invoice.findOne({booking:booking._id,company:booking.company,type:'GATE_OUT',status:{$in:['UNPAID','PARTIALLY_PAID']}});
+ if(!invoice)throw new AppError('The Gate-out invoice is not available for a new cash selection.',409);
+ if(await PaymentSubmission.exists({invoice:invoice._id,status:'PENDING_VERIFICATION'}))
+  throw new AppError('Payment proof is under review. It must be reviewed before changing the payment method.',409);
+ const changed=booking.gateOut.payment.method!=='CASH';
+ if(changed){
+  booking.gateOut.payment.method='CASH';booking.gateOut.payment.status='PENDING';
+  booking.gateOut.payment.amountSubmitted=invoice.paidAmount||0;
+  booking.gateOut.payment.referenceNumber='';booking.gateOut.payment.submittedAt=null;
+  await booking.save();
+  await createNotification({company:booking.company,audience:'ADMIN',type:'GATE_OUT_REQUESTED',
+   title:'Cash selected for Gate-out',message:`${booking.bookingReference} will pay Cash at the terminal cashier.`,
+   data:{id:booking._id,bookingId:booking._id,invoiceId:invoice._id}}).catch(console.error);
+  emitToAdminModule(MODULES.GATE_OUT,'gate-out:updated',{id:String(booking._id)});
+ }
+ res.json({success:true,message:'Cash selected. Your Gate-out invoice remains unpaid until the cashier records the payment.',
+  data:{bookingId:booking._id,method:'CASH',invoiceStatus:invoice.status,outstandingBalance:invoice.balance}});
+});
+
+export const submitPendingGateOutEvidence = asyncHandler(async(req,res)=>{
+ const file=req.file;
+ let committed=false;
+ try {
+  await validateUploadedProof(file);
+  const reference=String(req.body.paymentReferenceNumber||req.body.reference||'').trim();
+  validatePaymentEvidence(reference,file);
+  const methodId=String(req.body.paymentTypeId||req.body.method||'').trim();
+  const choice=await getPaymentChoice(methodId);
+  const method=choice.code;
+  if(reference&&await PaymentSubmission.exists({method,reference,status:{$in:['VERIFIED','PENDING_VERIFICATION']}}))
+   throw new AppError('This reference has already been used for an active or verified payment.',409);
+  const session=await mongoose.startSession();
+  let booking,invoice,payment;
+  try {
+   await session.withTransaction(async()=>{
+    booking=await PreAdvice.findOne({_id:req.params.id,company:req.user.company._id,workflowStage:'GATE_OUT_PAYMENT_PENDING'}).session(session);
+    if(!booking)throw new AppError('Gate-out payment is not currently awaiting collection.',409);
+    invoice=await Invoice.findOne({booking:booking._id,company:booking.company,type:'GATE_OUT',status:'UNPAID'}).session(session);
+    if(!invoice||Number(invoice.balance)<=0)throw new AppError('The Gate-out invoice is not available for this payment.',409);
+    if(await PaymentSubmission.exists({invoice:invoice._id,status:'PENDING_VERIFICATION'}).session(session))
+     throw new AppError('Payment evidence has already been submitted for this invoice.',409);
+    payment=(await PaymentSubmission.create([{
+      invoice:invoice._id,company:booking.company,booking:booking._id,method,paymentType:choice._id,
+      reference,amount:invoice.balance,receivingAccount:receivingAccountSnapshot(choice),
+      proof:file?{storedName:file.filename,name:file.originalname,mimeType:file.mimetype,size:file.size}:undefined,
+      submittedBy:req.user._id,status:'PENDING_VERIFICATION',
+    }],{session}))[0];
+    invoice.status='PAYMENT_SUBMITTED';await invoice.save({session});
+    booking.gateOut.payment.status='SUBMITTED';booking.gateOut.payment.method=method;
+    booking.gateOut.payment.amountSubmitted=invoice.balance;booking.gateOut.payment.referenceNumber=reference;
+    booking.gateOut.payment.submittedAt=new Date();
+    advanceWorkflow(booking,'GATE_OUT_PAYMENT_SUBMITTED',{note:'Gate-out transfer proof submitted; pending administrator verification'});
+    await booking.save({session});
+   });
+   committed=true;
+  } finally {await session.endSession();}
+  await createNotification({company:booking.company,audience:'ADMIN',type:'GATE_OUT_REQUESTED',
+    title:'Gate-out payment submitted for review',message:`${booking.bookingReference} submitted payment evidence.`,
+    data:{id:booking._id,bookingId:booking._id,invoiceId:invoice._id,paymentId:payment._id}}).catch(console.error);
+  clearSummaryCache();
+  emitToAdminModule(MODULES.GATE_OUT,'gate-out:updated',{id:String(booking._id)});
+  emitToAdminModule(MODULES.PAYMENT_HISTORY,'invoice:updated',{id:String(invoice._id)});
+  getIO()?.to(`company:${booking.company}`).emit('invoice:updated',{id:String(invoice._id),bookingId:String(booking._id)});
+  res.json({success:true,message:'Payment evidence submitted. Administrator verification is required.',data:{paymentId:payment._id,invoiceId:invoice._id}});
+ }catch(error){if(!committed&&file?.path)await fs.unlink(file.path).catch(()=>{});throw paymentReviewFailure(error,{reference:req.body?.paymentReferenceNumber||req.body?.reference});}
+});
+
 export const reviewClientGateOut=asyncHandler(async(req,res)=>{
  const decision=String(req.body?.decision||'').toUpperCase();
  const reason=String(req.body?.reason||'').trim().slice(0,800);

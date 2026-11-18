@@ -9,7 +9,7 @@ import { listDocuments } from '../utils/tableQuery.js';
 import { clearSummaryCache } from '../utils/summaryCache.js';
 import PaymentSubmission from '../models/PaymentSubmission.js';
 import ManualFinancialEntry from '../models/ManualFinancialEntry.js';
-import {getReceivingMethod,receivingAccountSnapshot} from '../services/paymentMethods.js';
+import {getReceivingMethod,getPaymentChoice,receivingAccountSnapshot} from '../services/paymentMethods.js';
 import PreAdvice from '../models/PreAdvice.js';
 import { buildInvoice } from '../services/invoicingService.js';
 import { uniqueReceiptNumber } from '../utils/uniqueReceipt.js';
@@ -75,14 +75,43 @@ export const ensureClientInvoice = asyncHandler(async (req,res) => {
   res.json({success:true,data:{invoice}});
 });
 
+
+// The customer can elect to pay cash at the facility. This is only a
+// preference/notification; the authorized cashier must record actual money
+// received using the existing verified manual-financial transaction workflow.
+export const selectClientCashPayment = asyncHandler(async (req, res) => {
+  const choice = await getPaymentChoice(req.body.paymentTypeId || req.body.method, { allowCash: true });
+  if (choice.code !== 'CASH') throw new AppError('Select Cash for an in-person payment.', 400);
+  const invoice = await Invoice.findOne({ _id: req.params.id, company: owner(req), type: 'GATE_IN', status: { $in: ['UNPAID','PARTIALLY_PAID'] } });
+  if (!invoice) throw new AppError('The selected Gate-in invoice is no longer payable.', 409);
+  const booking = await PreAdvice.findOne({ _id: invoice.booking, company: owner(req) });
+  if (!booking || !['READY_FOR_GATE_IN'].includes(booking.workflowStage))
+    throw new AppError('This booking is not available for a new cash-payment selection.', 409);
+  const changed = booking.gateIn.payment.method !== 'CASH';
+  if (changed) {
+    booking.gateIn.payment.method = 'CASH';
+    booking.gateIn.payment.status = 'PENDING';
+    await booking.save();
+    await createNotification({ company: invoice.company, audience: 'ADMIN', type: 'GATE_IN_CASH_REQUESTED',
+      title: 'Cash payment requested at Gate-in',
+      message: `${booking.bookingReference} chose Cash. The cashier must record actual payment before Gate-in.`,
+      data: { id: booking._id, bookingId: booking._id, invoiceId: invoice._id },
+    }).catch(error=>console.error('[CASH_PREFERENCE_ALERT_FAILED]',error.message));
+    emitToAdminModule(MODULES.GATE_IN,'gate-in:updated',{id:String(booking._id)});
+  }
+  res.json({ success: true, message: 'Cash selected. Your invoice remains unpaid until the cashier receives and records your payment.',
+    data: { invoiceId: invoice._id, method: 'CASH', paymentStatus: invoice.status, outstandingBalance: invoice.balance } });
+});
+
 export const submitProof = asyncHandler(async (req,res) => {
   const proof=req.file;
   let committed=false;
   try{
     await validateUploadedProof(proof);
-    const method=String(req.body.method||'').toUpperCase(),reference=String(req.body.reference||'').trim();
+    const methodId=String(req.body.method||'').trim(),reference=String(req.body.reference||'').trim();
     validatePaymentEvidence(reference,proof);
-    const receivingMethod = await getReceivingMethod(method);
+    const receivingMethod = await getReceivingMethod(methodId);
+    const method=receivingMethod.code;
     if (reference && await PaymentSubmission.exists({method,reference,status:{$in:['VERIFIED','PENDING_VERIFICATION']}})) {
       throw new AppError('This payment reference is already in use for an active or verified submission.',409);
     }
@@ -98,7 +127,7 @@ export const submitProof = asyncHandler(async (req,res) => {
         const amount=Number(req.body.amount);
         if(!Number.isFinite(amount)||Math.abs(amount-invoice.balance)>0.001)throw new AppError('Payment amount must match the invoice.',400);
         payment=(await PaymentSubmission.create([{
-          invoice:invoice._id,company:invoice.company,booking:invoice.booking,method,reference,amount,receivingAccount:receivingAccountSnapshot(receivingMethod),
+          invoice:invoice._id,company:invoice.company,booking:invoice.booking,method,paymentType:receivingMethod._id,reference,amount,receivingAccount:receivingAccountSnapshot(receivingMethod),
           proof:proof?{storedName:proof.filename,name:proof.originalname,mimeType:proof.mimetype,size:proof.size}:undefined,submittedBy:req.user._id,
           status:'PENDING_VERIFICATION',
         }],{session}))[0];
