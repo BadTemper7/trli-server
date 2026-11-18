@@ -1,3 +1,4 @@
+import {sendStoredDocument} from '../utils/storedDocuments.js';
 import fs from 'fs/promises';
 import path from 'path';
 import mongoose from 'mongoose';
@@ -236,10 +237,7 @@ export const listPendingPayments = asyncHandler(async (req,res) => {
 export const proofFile = asyncHandler(async (req,res) => {
   const payment=await PaymentSubmission.findOne({_id:req.params.id,...filterFor(req)}).lean();
   if(!payment?.proof?.storedName)throw new AppError('Payment proof not found.',404);
-  const full=path.resolve('uploads/payment-proofs',path.basename(payment.proof.storedName));
-  try{await fs.access(full);}catch{throw new AppError('Proof file is missing from server storage.',404);}
-  res.set('Cache-Control','private, no-store');
-  res.type(payment.proof.mimeType).set('Content-Disposition','inline; filename="payment-proof"').sendFile(full);
+  return sendStoredDocument(res, 'payment-proofs', payment.proof);
 });
 export const downloadFinancialPdf = asyncHandler(async (req,res) => {
   const invoice=await Invoice.findOne({_id:req.params.id,...filterFor(req)}).lean();

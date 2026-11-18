@@ -1,3 +1,4 @@
+import {sendStoredDocument} from '../utils/storedDocuments.js';
 import fs from 'fs';
 import path from 'path';
 import ClientCompany from '../models/ClientCompany.js';
@@ -116,12 +117,7 @@ export const document = asyncHandler(async (req, res) => {
   const item = company.documents.id(req.params.documentId);
   if (!item) throw new AppError('Document not found.', 404);
 
-  const filePath = path.resolve('uploads/client-verification', item.storedName);
-  if (!fs.existsSync(filePath)) throw new AppError('File not found.', 404);
-
-  res.type(item.mimeType || 'application/octet-stream');
-  res.setHeader('Content-Disposition', `inline; filename="${String(item.name || 'document').replace(/"/g, '')}"`);
-  res.sendFile(filePath);
+  return sendStoredDocument(res, 'client-verification', item);
 });
 
 export const approve = asyncHandler(async (req, res) => {

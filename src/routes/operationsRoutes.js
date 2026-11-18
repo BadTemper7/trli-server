@@ -1,3 +1,4 @@
+import {adminPreAdviceFile} from '../controllers/fileController.js';
 import { Router } from 'express';
 import {downloadGateInPass,downloadGateOutPass,downloadReleasePass,downloadOperationalInvoice} from '../controllers/printableController.js';
 import { adminAuth, requirePasswordChanged } from '../middleware/adminAuth.js';
@@ -17,6 +18,7 @@ router.use(adminAuth, requirePasswordChanged);
 
 router.get('/pre-advice', requirePermission(MODULES.PRE_ADVICE, ACTIONS.VIEW), listAdminPreAdvice);
 router.get('/pre-advice/summary', requirePermission(MODULES.PRE_ADVICE, ACTIONS.VIEW), (req,res,next)=>{req.params.resource='pre-advice';return operationSummary(req,res,next);});
+router.get('/pre-advice/:id/documents/:documentId', validateId(), validateId('documentId'), requirePermission(MODULES.PRE_ADVICE, ACTIONS.VIEW), adminPreAdviceFile);
 router.get('/pre-advice/:id', validateId(), requirePermission(MODULES.PRE_ADVICE, ACTIONS.VIEW), getAdminPreAdvice);
 router.post('/pre-advice/:id/approve', validateId(), requirePermission(MODULES.PRE_ADVICE, ACTIONS.EDIT), approvePreAdvice);
 router.post('/pre-advice/:id/reject', validateId(), requirePermission(MODULES.PRE_ADVICE, ACTIONS.EDIT), rejectPreAdvice);

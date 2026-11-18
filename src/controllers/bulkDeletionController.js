@@ -1,3 +1,4 @@
+import {filePath} from '../utils/storedDocuments.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import mongoose from 'mongoose';
@@ -210,7 +211,7 @@ async function cleanupFiles(files) {
   const failures=[];
   for(const [folder,name] of files){
     if(!/^[a-f0-9-]{30,}\.(pdf|png|jpe?g)$/i.test(String(name)))continue;
-    try{await fs.unlink(path.resolve('uploads',folder,path.basename(name)));}catch(e){if(e.code!=='ENOENT')failures.push(name);}
+    try{await fs.unlink(filePath(folder,name));}catch(e){if(e.code!=='ENOENT')failures.push(name);}
   }
   return failures;
 }

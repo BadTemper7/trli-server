@@ -1,3 +1,4 @@
+import {validateEirSubmission} from '../utils/eirDocuments.js';
 import PreAdvice from '../models/PreAdvice.js';
 import Invoice from '../models/Invoice.js';
 import Rate from '../models/Rate.js';
@@ -42,7 +43,7 @@ const pick = (body) => Object.fromEntries(
 
 const fileDocs = (req) => Object.entries(req.files || {}).flatMap(([type, files]) =>
   files.map((file) => ({
-    type,
+    type: type === 'deliveryOrder' ? 'eir' : type,
     name: file.originalname,
     storedName: file.filename,
     mimeType: file.mimetype,
@@ -116,6 +117,7 @@ export const create = asyncHandler(async (req, res) => {
   const data = pick(req.body);
   validateGateInSchedule(data);
   await requireAvailableReeferLoadStatus(data);
+  validateEirSubmission(req.files);
 
   data.bookingReference = await nextReference('BOOKING');
   data.company = req.user.company._id;
@@ -163,6 +165,7 @@ export const update = asyncHandler(async (req, res) => {
   }
 
   const updates = pick(req.body);
+  validateEirSubmission(req.files, item.documents);
   if (['containerType','containerSize','loadStatus','transactionClassification'].some(k => updates[k] !== undefined && updates[k] !== item[k])) {
     await requireAvailableReeferLoadStatus(updates, item);
   }

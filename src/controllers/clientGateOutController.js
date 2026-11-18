@@ -1,3 +1,4 @@
+import {sendStoredDocument} from '../utils/storedDocuments.js';
 import mongoose from 'mongoose';
 import fs from 'fs/promises';
 import path from 'path';
@@ -251,9 +252,7 @@ export const adminGateOutProof=asyncHandler(async(req,res)=>{
  const payment=await PaymentSubmission.findById(req.params.paymentId).lean();
  const invoice=payment&&await Invoice.findOne({_id:payment.invoice,type:'GATE_OUT'}).lean();
  if(!invoice||!payment.proof?.storedName)throw new AppError('Gate-out payment proof not found.',404);
- const file=path.resolve('uploads/payment-proofs',path.basename(payment.proof.storedName));
- try{await fs.access(file)}catch{throw new AppError('Proof is missing from server storage.',404)}
- res.set('Cache-Control','private,no-store').type(payment.proof.mimeType).set('Content-Disposition','inline; filename="gate-out-proof"').sendFile(file);
+ return sendStoredDocument(res, 'payment-proofs', payment.proof);
 });
 export const adminGateOutPdf=asyncHandler(async(req,res)=>{
  const booking=await PreAdvice.findById(req.params.id).lean();

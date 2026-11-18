@@ -239,7 +239,7 @@ export const listAdminPreAdvice = asyncHandler(async (req, res) => {
 export const getAdminPreAdvice = asyncHandler(async (req, res) => {
   const item = await findItem(req.params.id);
   const [gateIn, gateOut] = await Promise.all([paymentSummary(item, 'GATE_IN'), paymentSummary(item, 'GATE_OUT')]);
-  res.json({ success: true, message: 'Pre-advice loaded.', data: itemDto(item, { charges: { gateIn, gateOut } }) });
+  res.json({ success: true, message: 'Pre-advice loaded.', data: itemDto(item, { charges: { gateIn, gateOut }, documents: (item.documents || []).map(doc=>({id:String(doc._id),type:doc.type,name:doc.name,mimeType:doc.mimeType,size:doc.size})) }) });
 });
 
 export const approvePreAdvice = asyncHandler(async (req, res) => {
